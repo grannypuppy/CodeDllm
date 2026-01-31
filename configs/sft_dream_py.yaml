@@ -1,0 +1,60 @@
+wandb:
+  entity: null
+  resume: 'auto'
+
+
+experiment:
+    project: "sft_dream_py" # need to be same of this file name
+    wandb_run_name: "5e-7lr_2lm_8ga_2gpus_p0-1_masktime7_forcefullmask_1000traincases_2epochs" # your wandb run name
+    num_node: 1 # the number of machines you have
+
+
+model:
+    # pretrained_model: "projects/sft_dream_py/overfit_5e-7lr_1lm_2ga_4gpus_p0.1-0.7_masktime4_chatformat/checkpoint-100" # 请务必将这里替换为您的 dream 预训练模型所在的绝对路径
+    pretrained_model: "./projects/sft_dream_py/5e-7lr_2lm_8ga_2gpus_p0-1_masktime7_forcefullmask_1000traincases/final" 
+    
+# sft dataset
+dataset:
+    optimization_data: "python_splits_dllm_sft/train.json" # 指向您的训练数据
+    validation_data: "python_splits_dllm_sft/train.json" # 指向您的验证数据
+
+training:
+    gradient_checkpointing_enable: True # if the sequence is very larger, set as True
+    gradient_accumulation_steps: 8
+    batch_size_lm: 2 # the total batch size is num_node * num_gpu_per_node * gradient_accumulation_steps * batch_size_lm
+    mixed_precision: "bf16"
+    enable_tf32: True
+    seed: 10086
+    num_train_epochs: 2
+    max_grad_norm: 1
+    ckpt_interval: 50 # 保存模型的间隔步数
+    val_loss_interval: 50 # 计算验证集loss的间隔步数
+    method: "random_masking" # "random_masking""semi-ar"
+    lower_p: 0.0
+    upper_p: 1.0
+    block_size: 16 # use for semi-ar
+    mask_times_per_sample: 7 # for random_masking
+    post_num: 0 # number of pad token need to be trained for each data point
+    max_gen_length: 1024
+    max_prompt_len: 1024
+
+
+
+optimizer:
+    name: adamw
+    params: # default adamw params
+        learning_rate: 5e-7
+        scale_lr: False # scale learning rate by total batch size
+        beta1: 0.9
+        beta2: 0.99
+        weight_decay: 0.01
+        epsilon: 1e-8
+
+lr_scheduler:
+    scheduler: "cosine"
+    params:
+        learning_rate: ${optimizer.params.learning_rate}
+        warmup_steps: 0.1
+        min_lr_scale: 0
+
+
