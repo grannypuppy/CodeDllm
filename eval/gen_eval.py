@@ -8,8 +8,8 @@ import fire
 import types
 
 try:
-    from model import DreamModel, DreamTokenizer
-    from model.generation_utils_block import DreamGenerationMixin as BlockDreamGenerationMixin
+    from models import DreamModel, DreamTokenizer
+    from models.dream.generation_utils_block import DreamGenerationMixin as BlockDreamGenerationMixin
 except ImportError as e:
     logger.warning(f"Could not import Dream model components: {e}. Ensure you are in the correct environment and 'model' package is available.")
     DreamModel = None
