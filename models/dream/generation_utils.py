@@ -499,6 +499,10 @@ class DreamGenerationMixin:
         print(f'used steps: {steps}')
         end_time = time.time()
         print(f'used time: {end_time - start_time}')
+
+        # final hook call after diffusion sampling completes
+        x = generation_tokens_hook_func(-1, x, None)
+        
         if return_dict_in_generate:
             return DreamModelOutput(
                 sequences=x,

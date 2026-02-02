@@ -373,6 +373,8 @@ class DreamGenerationMixin:
         threshold = kwargs.get("threshold", 0.9)
         block_length = kwargs.get("block_length", 32)
         dual_cache = kwargs.get("dual_cache", False)
+        generation_tokens_hook_func = kwargs.pop("generation_tokens_hook_func", lambda step, x, logits: x)
+        generation_logits_hook_func = kwargs.pop("generation_logits_hook_func", lambda step, x, logits: logits)
 
         result = self._sample(
             input_ids,
@@ -380,7 +382,9 @@ class DreamGenerationMixin:
             generation_config=generation_config,
             threshold=threshold,
             block_length=block_length,
-            dual_cache=dual_cache
+            dual_cache=dual_cache,
+            generation_tokens_hook_func=generation_tokens_hook_func,
+            generation_logits_hook_func=generation_logits_hook_func,
         )
         return result
 
@@ -389,6 +393,8 @@ class DreamGenerationMixin:
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.LongTensor],
         generation_config: DreamGenerationConfig,
+        generation_tokens_hook_func,
+        generation_logits_hook_func,
         threshold: Optional[float] = 0.9,
         block_length: Optional[int] = 32,
         dual_cache: bool = False,
@@ -399,6 +405,7 @@ class DreamGenerationMixin:
         return_dict_in_generate = generation_config.return_dict_in_generate
         max_length = generation_config.max_length
         mask_token_id = generation_config.mask_token_id
+        eos_token_id = generation_config.eos_token_id
         steps = generation_config.steps
         temperature = generation_config.temperature
         top_p = generation_config.top_p
@@ -410,6 +417,8 @@ class DreamGenerationMixin:
 
         # pad input_ids to max_length
         x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
+        # allow user-defined token control of the initial padded sequence
+        x = generation_tokens_hook_func(None, x, None)
         gen_length = max_length - input_ids.shape[1]
         
         # Handle block configuration
@@ -440,6 +449,7 @@ class DreamGenerationMixin:
 
         # Initialize cache for the prompt
         past_key_values = None
+        step_idx = 0
 
         # Process each block
         for num_block in range(num_blocks):
@@ -452,9 +462,12 @@ class DreamGenerationMixin:
             past_key_values = model_output.past_key_values
             logits = model_output.logits
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+            logits = generation_logits_hook_func(step_idx, x, logits)
             confidence, x0 = sample_tokens(logits, temperature=temperature, top_p=top_p, top_k=top_k)
             x[:, current_block_start] = x0[:, current_block_start]
-            
+            x = generation_tokens_hook_func(step_idx, x, logits)
+            step_idx += 1
+
             # Extract only previous block cache
             if not dual_cache:
                 new_past_key_values = []
@@ -492,6 +505,19 @@ class DreamGenerationMixin:
                                     past_key_values=past_key_values, use_cache=True)
                 logits = model_output.logits
                 logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+                # generation_utils._sample always forwards full x, so logits shape (B, max_length, V); block version
+                # forwards x[:, current_block_start:] (or current block only), so logits are truncated. Pad to full
+                # length so generation_logits_hook_func(step, x, logits) receives same shape as in generation_utils.
+                logits_len = logits.shape[1]
+                full_logits = torch.full(
+                    (x.shape[0], x.shape[1], logits.shape[-1]),
+                    torch.finfo(logits.dtype).min,
+                    device=logits.device,
+                    dtype=logits.dtype,
+                )
+                full_logits[:, current_block_start : current_block_start + logits_len, :] = logits
+                full_logits = generation_logits_hook_func(step_idx, x, full_logits)
+                logits = full_logits[:, current_block_start : current_block_start + logits_len, :]
                 if alg == 'confidence_threshold':
                     mask_logits = logits[mask_index]
                 
@@ -558,10 +584,32 @@ class DreamGenerationMixin:
                             x[:, current_block_start:][row_indices,transfer_index] = x_[row_indices,transfer_index]
                     i += 1
 
+                x = generation_tokens_hook_func(step_idx, x, full_logits)
+                step_idx += 1
                 if (x[:, current_block_start:current_block_end] == mask_token_id).sum() == 0:
                     break
 
-        
+            # Early stop: if entire block is eos_token, fill remaining with eos and stop
+            if eos_token_id is not None:
+                eos_id = eos_token_id
+                if isinstance(eos_id, torch.Tensor):
+                    eos_id = eos_id.item() if eos_id.numel() == 1 else eos_id[0].item()
+                elif isinstance(eos_id, (list, tuple)):
+                    eos_id = eos_id[0] if eos_id else None
+                if eos_id is not None:
+                    block_tokens = x[:, current_block_start:current_block_end]
+                    if (block_tokens == eos_id).all():
+                        remaining_mask = (x[:, current_block_end:] == mask_token_id)
+                        x[:, current_block_end:] = torch.where(
+                            remaining_mask,
+                            torch.full_like(x[:, current_block_end:], eos_id),
+                            x[:, current_block_end:]
+                        )
+                        break
+
+        # final hook call after diffusion sampling completes
+        x = generation_tokens_hook_func(-1, x, None)
+
         if return_dict_in_generate:
             return DreamModelOutput(
                 sequences=x,
