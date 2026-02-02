@@ -1,7 +1,5 @@
-# coding=utf-8
-# Copyright 2024 The Dream team, HKUNLP Group and The HuggingFace Inc. team. All rights reserved.
+# Copyright 2025 NVIDIA CORPORATION & AFFILIATES
 #
-# This code is based on Qwen's implementations in this library.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -13,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Modified from Dream repos: https://github.com/HKUNLP/Dream
+
 """Tokenization classes for Dream."""
 
 import json
@@ -46,6 +49,7 @@ def bytes_to_unicode():
     """
     Returns list of utf-8 byte and a mapping to unicode strings. We specifically avoids mapping to whitespace/control
     characters the bpe code barfs on.
+
     The reversible bpe codes work on unicode strings. This means you need a large # of unicode characters in your vocab
     if you want to avoid UNKs. When you're at something like a 10B token dataset you end up needing around 5K for
     decent coverage. This is a significant percentage of your normal, say, 32K bpe vocab. To avoid that, we want lookup
@@ -69,6 +73,7 @@ def bytes_to_unicode():
 def get_pairs(word):
     """
     Return set of symbol pairs in a word.
+
     Word is represented as tuple of symbols (symbols being variable-length strings).
     """
     pairs = set()
@@ -82,20 +87,27 @@ def get_pairs(word):
 class DreamTokenizer(PreTrainedTokenizer):
     """
     Construct a Dream tokenizer. Based on byte-level Byte-Pair-Encoding.
+
     Same with GPT2Tokenizer, this tokenizer has been trained to treat spaces like parts of the tokens so a word will
     be encoded differently whether it is at the beginning of the sentence (without space) or not:
+
     ```python
     >>> from transformers import AutoTokenizer
+
     >>> tokenizer = AutoTokenizer.from_pretrained("Dream-org/Dream-v0-Base-7B", trust_remote_code=True)
     >>> tokenizer("Hello world")["input_ids"]
     [9707, 1879]
+
     >>> tokenizer(" Hello world")["input_ids"]
     [21927, 1879]
     ```
     This is expected.
+
     You should not use GPT2Tokenizer instead, because of the different pretokenization rules.
+
     This tokenizer inherits from [`PreTrainedTokenizer`] which contains most of the main methods. Users should refer to
     this superclass for more information regarding those methods.
+
     Args:
         vocab_file (`str`):
             Path to the vocabulary file.

@@ -13,10 +13,8 @@
 # limitations under the License.
 #
 # SPDX-License-Identifier: Apache-2.0
-
 # Modified from Dream repos: https://github.com/HKUNLP/Dream
 
-import time
 import warnings
 import copy
 from dataclasses import dataclass
@@ -36,6 +34,26 @@ from transformers.utils import (
 )
 
 logger = logging.get_logger(__name__)
+
+def get_num_transfer_tokens(mask_index, steps):
+    '''
+    In the reverse process, the interval [0, 1] is uniformly discretized into steps intervals.
+    Furthermore, because LLaDA employs a linear noise schedule (as defined in Eq. (8)),
+    the expected number of tokens transitioned at each step should be consistent.
+
+    This function is designed to precompute the number of tokens that need to be transitioned at each step.
+    '''
+    mask_num = mask_index.sum(dim=1, keepdim=True)
+
+    base = mask_num // steps
+    remainder = mask_num % steps
+
+    num_transfer_tokens = torch.zeros(mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64) + base
+
+    for i in range(mask_num.size(0)):
+        num_transfer_tokens[i, :remainder[i]] += 1
+
+    return num_transfer_tokens
 
 
 def top_p_logits(logits, top_p=None):
@@ -306,8 +324,6 @@ class DreamGenerationMixin:
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
         generation_config = self._prepare_generation_config(generation_config, **kwargs)
-        generation_tokens_hook_func = kwargs.pop("generation_tokens_hook_func", lambda step, x, logits: x)
-        generation_logits_hook_func = kwargs.pop("generation_logits_hook_func", lambda step, x, logits: logits)
 
         # 2. Define model inputs
         assert inputs is not None
@@ -355,14 +371,16 @@ class DreamGenerationMixin:
             attention_mask=attention_mask 
         )
         threshold = kwargs.get("threshold", 0.9)
+        block_length = kwargs.get("block_length", 32)
+        dual_cache = kwargs.get("dual_cache", False)
 
         result = self._sample(
             input_ids,
             attention_mask=attention_mask,
             generation_config=generation_config,
-            generation_tokens_hook_func=generation_tokens_hook_func,
-            generation_logits_hook_func=generation_logits_hook_func,
-            threshold=threshold
+            threshold=threshold,
+            block_length=block_length,
+            dual_cache=dual_cache
         )
         return result
 
@@ -371,27 +389,39 @@ class DreamGenerationMixin:
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.LongTensor],
         generation_config: DreamGenerationConfig,
-        generation_tokens_hook_func,
-        generation_logits_hook_func,
-        threshold: Optional[float] = 0.9
+        threshold: Optional[float] = 0.9,
+        block_length: Optional[int] = 32,
+        dual_cache: bool = False,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
+        
         output_history = generation_config.output_history
         return_dict_in_generate = generation_config.return_dict_in_generate
         max_length = generation_config.max_length
         mask_token_id = generation_config.mask_token_id
         steps = generation_config.steps
-        eps = generation_config.eps
-        alg = generation_config.alg
-        alg_temp = generation_config.alg_temp
         temperature = generation_config.temperature
         top_p = generation_config.top_p
         top_k = generation_config.top_k
+        alg = generation_config.alg
+        alg_temp = generation_config.alg_temp
 
         histories = [] if (return_dict_in_generate and output_history) else None
-        start_time = time.time()
+
         # pad input_ids to max_length
         x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
+        gen_length = max_length - input_ids.shape[1]
+        
+        # Handle block configuration
+        if block_length is None:
+            block_length = gen_length  # Default: single block (original behavior)
+        
+        assert gen_length % block_length == 0, f"gen_length ({gen_length}) must be divisible by block_length ({block_length})"
+        num_blocks = gen_length // block_length
+        
+        assert steps % num_blocks == 0, f"steps ({steps}) must be divisible by num_blocks ({num_blocks})"
+        steps_per_block = steps // num_blocks
+        timesteps = torch.linspace(1, generation_config.eps, steps_per_block + 1, device=x.device)
 
         if attention_mask is not None and torch.any(attention_mask == 0.0):
             # we do not mask the [MASK] tokens so value = 1.0
@@ -408,97 +438,130 @@ class DreamGenerationMixin:
             tok_idx = None
             attention_mask = "full"
 
-        timesteps = torch.linspace(1, eps, steps + 1, device=x.device)
+        # Initialize cache for the prompt
+        past_key_values = None
 
-        # this allows user-defined token control of the intermediate steps
-        x = generation_tokens_hook_func(None, x, None)
-        i = 0
-        if alg == 'confidence_threshold':
-            mask_index = (x == mask_token_id)
-            assert mask_index.sum() % steps == 0, "mask_index.sum() must be divisible by steps"
-            assert x.shape[0] == 1, "batch size must be 1"
+        # Process each block
+        for num_block in range(num_blocks):
+            
+            current_block_start = input_ids.shape[1] + num_block * block_length
+            current_block_end = current_block_start + block_length
 
-            number_transfer_tokens = mask_index.sum().item() // steps
-            left_tokens_last_step = 0
-        while i < steps:
-            mask_index = (x == mask_token_id)
-            logits = self(x, attention_mask, tok_idx).logits
+            # update cache
+            model_output = self(x, attention_mask, tok_idx, use_cache=True)
+            past_key_values = model_output.past_key_values
+            logits = model_output.logits
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
-
-            # this allows user-defined logits control of the intermediate steps
-            logits = generation_logits_hook_func(i, x, logits)
-
-            mask_logits = logits[mask_index]
-            if not alg == 'confidence_threshold':
-                t = timesteps[i]
-                s = timesteps[i + 1]
-        
-            if alg == 'origin':
-                p_transfer = 1 - s / t if i < steps - 1 else 1
-                x0 = torch.zeros_like(x[mask_index], device=self.device, dtype=torch.long) + mask_token_id
-                transfer_index_t_s = torch.rand(*x0.shape, device=self.device) < p_transfer
-                _, x0[transfer_index_t_s]= sample_tokens(mask_logits[transfer_index_t_s], temperature=temperature, top_p=top_p, top_k=top_k)
-                x[mask_index] = x0.clone()
-            elif alg == 'confidence_threshold':
-                confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
-                x_ = torch.zeros_like(x, device=self.device, dtype=torch.long) + mask_token_id
-                x_[mask_index] = x0.clone()
-                full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
-                full_confidence[mask_index] = confidence
-                current_transfer_tokens = number_transfer_tokens + left_tokens_last_step
-                left_tokens_last_step = 0
-                selected_confidence, select_index = torch.topk(full_confidence, current_transfer_tokens)
-                transfer_index = torch.zeros_like(x, device=x.device, dtype=torch.bool)
-                select_index = select_index.to(x.device)
-                transfer_index[0, select_index[0]] = True
-                for k in range(1, current_transfer_tokens):
-                    if selected_confidence[0, k] < threshold:
-                        if i < steps - 1:
-                            left_tokens_last_step += 1
-                            transfer_index[0, select_index[0, k]] = False
-                        else:
-                            number_transfer_tokens = 0
-                            steps += 1
-                            left_tokens_last_step += 1
-                            transfer_index[0, select_index[0, k]] = False
-
-                x[transfer_index] = x_[transfer_index].clone()
-
+            confidence, x0 = sample_tokens(logits, temperature=temperature, top_p=top_p, top_k=top_k)
+            x[:, current_block_start] = x0[:, current_block_start]
+            
+            # Extract only previous block cache
+            if not dual_cache:
+                new_past_key_values = []
+                for i in range(len(past_key_values)):
+                    new_past_key_values.append(())
+                    for j in range(len(past_key_values[i])):
+                        new_past_key_values[i] += (past_key_values[i][j][:, :current_block_start, :],)
+                past_key_values = new_past_key_values
             else:
-                if alg == 'maskgit_plus':
-                    confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
-                elif alg == 'topk_margin':
-                    confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k, margin_confidence=True)
-                elif alg == 'entropy':
-                    confidence, x0 = sample_tokens(mask_logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True)
+                replace_position = torch.zeros_like(x, dtype=torch.bool)
+                replace_position[:, current_block_start:current_block_end] = 1
+                
+            i = 1
+            while True:
+                # Use cache for generation
+                if dual_cache:
+                    mask_index = (x[:, current_block_start:current_block_end] == mask_token_id)
                 else:
-                    raise RuntimeError(f"Unknown alg: {alg}")
-                num_mask_token = mask_index.sum() / mask_index.shape[0]
-                number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps - 1 else int(num_mask_token)
-                full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
-                full_confidence[mask_index] = confidence
-                if number_transfer_tokens > 0:
-                    if alg_temp is None or alg_temp == 0:
-                        _, transfer_index = torch.topk(full_confidence, number_transfer_tokens)
+                    mask_index = (x[:, current_block_start:] == mask_token_id)
+                
+                # Prepare attention mask for cached generation
+                if attention_mask != "full":
+                    # Adjust attention mask for current position
+                    current_attention_mask = attention_mask[:, :, :, current_block_start:]
+                else:
+                    current_attention_mask = attention_mask
+                
+                if dual_cache:
+                    model_output = self(x[:, current_block_start:current_block_end], current_attention_mask, 
+                                    tok_idx[:, current_block_start:current_block_end] if tok_idx is not None else None, 
+                                    past_key_values=past_key_values, use_cache=True, dual_cache=dual_cache, replace_position=replace_position)
+                else:
+                    model_output = self(x[:, current_block_start:], current_attention_mask, 
+                                    tok_idx[:, current_block_start:] if tok_idx is not None else None, 
+                                    past_key_values=past_key_values, use_cache=True)
+                logits = model_output.logits
+                logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+                if alg == 'confidence_threshold':
+                    mask_logits = logits[mask_index]
+                
+                    confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
+                    
+                    if dual_cache:
+                        x_ = torch.zeros_like(x[:, current_block_start:current_block_end], device=self.device, dtype=torch.long) + mask_token_id
+                        full_confidence = torch.full_like(x[:, current_block_start:current_block_end], -torch.inf, device=self.device, dtype=logits.dtype)
                     else:
-                        full_confidence = full_confidence / alg_temp
-                        full_confidence = F.softmax(full_confidence, dim=-1)
-                        transfer_index = torch.multinomial(full_confidence, num_samples=number_transfer_tokens)
-                    x_ = torch.zeros_like(x, device=self.device, dtype=torch.long) + mask_token_id
+                        x_ = torch.zeros_like(x[:, current_block_start:], device=self.device, dtype=torch.long) + mask_token_id
+                        full_confidence = torch.full_like(x[:, current_block_start:], -torch.inf, device=self.device, dtype=logits.dtype)
+                    
                     x_[mask_index] = x0.clone()
-                    row_indices = torch.arange(x.size(0), device=self.device).unsqueeze(1).expand_as(transfer_index)
-                    x[row_indices,transfer_index] = x_[row_indices,transfer_index]
+                    full_confidence[mask_index] = confidence
+                    full_confidence[:, block_length:] = -torch.inf
+                    
+                    current_transfer_tokens = (x[:, current_block_start:current_block_end] == mask_token_id).sum()
+                    
+                    selected_confidence, select_index = torch.topk(full_confidence, current_transfer_tokens)
+                    transfer_index = torch.zeros_like(x_, device=x.device, dtype=torch.bool)
+                    
+                    select_index = select_index.to(x.device)
+                    transfer_index[0, select_index[0]] = True
+                    for k in range(1, current_transfer_tokens):
+                        if selected_confidence[0, k] < threshold:
+                            transfer_index[0, select_index[0, k]] = False
+                    if dual_cache:
+                        x[:, current_block_start:current_block_end][transfer_index] = x_[transfer_index]
+                    else:
+                        x[:, current_block_start:][transfer_index] = x_[transfer_index]
+                else:
+                    if i == steps_per_block:
+                        break
+                    t = timesteps[i]
+                    s = timesteps[i + 1]
+                    mask_index[:, block_length:] = False
+                    mask_logits = logits[mask_index]
+                    confidence, x0 = sample_tokens(mask_logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True)
+                    num_mask_token = mask_index.sum() / mask_index.shape[0]
+                    number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps_per_block - 1 else int(num_mask_token)
+                    if dual_cache:
+                        full_confidence = torch.full_like(x[:, current_block_start:current_block_end], -torch.inf, device=self.device, dtype=logits.dtype)
+                    else:
+                        full_confidence = torch.full_like(x[:, current_block_start:], -torch.inf, device=self.device, dtype=logits.dtype)
+                    full_confidence[mask_index] = confidence
+                    full_confidence[:, block_length:] = -torch.inf
+                    
+                    if number_transfer_tokens > 0:
+                        if alg_temp is None or alg_temp == 0:
+                            _, transfer_index = torch.topk(full_confidence, number_transfer_tokens)
+                        else:
+                            full_confidence = full_confidence / alg_temp
+                            full_confidence = F.softmax(full_confidence, dim=-1)
+                            transfer_index = torch.multinomial(full_confidence, num_samples=number_transfer_tokens)
+                        if dual_cache:
+                            x_ = torch.zeros_like(x[:, current_block_start:current_block_end], device=self.device, dtype=torch.long) + mask_token_id
+                        else:
+                            x_ = torch.zeros_like(x[:, current_block_start:], device=self.device, dtype=torch.long) + mask_token_id
+                        x_[mask_index] = x0.clone()
+                        row_indices = torch.arange(x.size(0), device=self.device).unsqueeze(1).expand_as(transfer_index)
+                        if dual_cache:
+                            x[:, current_block_start:current_block_end][row_indices,transfer_index] = x_[row_indices,transfer_index]
+                        else:
+                            x[:, current_block_start:][row_indices,transfer_index] = x_[row_indices,transfer_index]
+                    i += 1
 
-            # this allows user-defined token control of the intermediate steps
-            x = generation_tokens_hook_func(i, x, logits)
+                if (x[:, current_block_start:current_block_end] == mask_token_id).sum() == 0:
+                    break
 
-            if histories is not None:
-                histories.append(x.clone())
-            i += 1
         
-        print(f'used steps: {steps}')
-        end_time = time.time()
-        print(f'used time: {end_time - start_time}')
         if return_dict_in_generate:
             return DreamModelOutput(
                 sequences=x,
