@@ -165,7 +165,7 @@ class DreamGenerationConfig(GenerationConfig):
         # Validate the values of the attributes
         self.validate(is_init=True)
 
-    def validate(self, is_init=False):
+    def validate(self, is_init=False, **kwargs):
         pass
 
 class DreamGenerationMixin:
@@ -375,6 +375,8 @@ class DreamGenerationMixin:
         dual_cache = kwargs.get("dual_cache", False)
         generation_tokens_hook_func = kwargs.pop("generation_tokens_hook_func", lambda step, x, logits: x)
         generation_logits_hook_func = kwargs.pop("generation_logits_hook_func", lambda step, x, logits: logits)
+        tokenizer = kwargs.pop("tokenizer", None)
+        detailed_log = kwargs.pop("detailed_log", False)
 
         result = self._sample(
             input_ids,
@@ -385,6 +387,8 @@ class DreamGenerationMixin:
             dual_cache=dual_cache,
             generation_tokens_hook_func=generation_tokens_hook_func,
             generation_logits_hook_func=generation_logits_hook_func,
+            tokenizer=tokenizer,
+            detailed_log=detailed_log,
         )
         return result
 
@@ -398,6 +402,8 @@ class DreamGenerationMixin:
         threshold: Optional[float] = 0.9,
         block_length: Optional[int] = 32,
         dual_cache: bool = False,
+        tokenizer=None,
+        detailed_log: bool = False,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
         
@@ -463,9 +469,30 @@ class DreamGenerationMixin:
             logits = model_output.logits
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
             logits = generation_logits_hook_func(step_idx, x, logits)
-            confidence, x0 = sample_tokens(logits, temperature=temperature, top_p=top_p, top_k=top_k)
-            x[:, current_block_start] = x0[:, current_block_start]
+            # 一次全序列采样，与 generation_utils 一致（新 unmask + 已 unmask 均用此次结果）
+            confidence_full_step, x0_full = sample_tokens(
+                logits, temperature=temperature, top_p=top_p, top_k=top_k,
+                margin_confidence=(alg == 'topk_margin'), neg_entropy=(alg == 'entropy')
+            )
+            x[:, current_block_start] = x0_full[:, current_block_start]
             x = generation_tokens_hook_func(step_idx, x, logits)
+            # --- Detailed step logging (block, first step of block) ---
+            if detailed_log and tokenizer is not None and x.shape[0] > 0:
+                mask_id = mask_token_id.item() if isinstance(mask_token_id, torch.Tensor) else mask_token_id
+                b_idx = 0
+                start, end = current_block_start, min(current_block_start + block_length, x.shape[1])
+                logger.info(f"=== Block {num_block} Step {step_idx - 1} (after update) [positions {start}:{end}] ===")
+                logger.info(f"{'Pos':<6} | {'Sampled':<20} | {'Updated':<20} | {'Confidence':<10} | {'Changed':<6}")
+                logger.info("-" * 75)
+                for pos in range(start, end):
+                    sampled_id = x0_full[b_idx, pos].item()
+                    updated_id = x[b_idx, pos].item()
+                    conf = confidence_full_step[b_idx, pos].item()
+                    s_sampled = tokenizer.decode([sampled_id]) if sampled_id != mask_id else "<MASK>"
+                    s_updated = tokenizer.decode([updated_id]) if updated_id != mask_id else "<MASK>"
+                    changed = "Yes" if sampled_id != updated_id else "No"
+                    logger.info(f"{pos:<6} | {s_sampled[:18]:<20} | {s_updated[:18]:<20} | {conf:.4f}     | {changed:<6}")
+                logger.info("=" * 75)
             step_idx += 1
 
             # Extract only previous block cache
@@ -518,53 +545,46 @@ class DreamGenerationMixin:
                 full_logits[:, current_block_start : current_block_start + logits_len, :] = logits
                 full_logits = generation_logits_hook_func(step_idx, x, full_logits)
                 logits = full_logits[:, current_block_start : current_block_start + logits_len, :]
+                # 一次全序列采样：新 unmask 与已 unmask 均用此次结果覆盖（与 generation_utils 一致）
+                confidence_full, x0_full = sample_tokens(
+                    logits, temperature=temperature, top_p=top_p, top_k=top_k,
+                    margin_confidence=(alg == 'topk_margin'), neg_entropy=(alg == 'entropy')
+                )
+                x_slice = x[:, current_block_start : current_block_start + logits_len]
                 if alg == 'confidence_threshold':
-                    mask_logits = logits[mask_index]
-                
-                    confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
-                    
                     if dual_cache:
-                        x_ = torch.zeros_like(x[:, current_block_start:current_block_end], device=self.device, dtype=torch.long) + mask_token_id
-                        full_confidence = torch.full_like(x[:, current_block_start:current_block_end], -torch.inf, device=self.device, dtype=logits.dtype)
+                        full_confidence = torch.full_like(x_slice, -torch.inf, device=self.device, dtype=logits.dtype)
                     else:
-                        x_ = torch.zeros_like(x[:, current_block_start:], device=self.device, dtype=torch.long) + mask_token_id
-                        full_confidence = torch.full_like(x[:, current_block_start:], -torch.inf, device=self.device, dtype=logits.dtype)
-                    
-                    x_[mask_index] = x0.clone()
-                    full_confidence[mask_index] = confidence
+                        full_confidence = torch.full_like(x_slice, -torch.inf, device=self.device, dtype=logits.dtype)
+                    full_confidence[mask_index] = confidence_full[mask_index]
                     full_confidence[:, block_length:] = -torch.inf
                     
                     current_transfer_tokens = (x[:, current_block_start:current_block_end] == mask_token_id).sum()
                     
                     selected_confidence, select_index = torch.topk(full_confidence, current_transfer_tokens)
-                    transfer_index = torch.zeros_like(x_, device=x.device, dtype=torch.bool)
-                    
+                    transfer_index = torch.zeros_like(x_slice, device=x.device, dtype=torch.bool)
                     select_index = select_index.to(x.device)
                     transfer_index[0, select_index[0]] = True
                     for k in range(1, current_transfer_tokens):
                         if selected_confidence[0, k] < threshold:
                             transfer_index[0, select_index[0, k]] = False
-                    if dual_cache:
-                        x[:, current_block_start:current_block_end][transfer_index] = x_[transfer_index]
-                    else:
-                        x[:, current_block_start:][transfer_index] = x_[transfer_index]
+                    x_slice[~mask_index] = x0_full[~mask_index]
+                    x_slice[transfer_index] = x0_full[transfer_index]
                 else:
                     if i == steps_per_block:
                         break
                     t = timesteps[i]
                     s = timesteps[i + 1]
                     mask_index[:, block_length:] = False
-                    mask_logits = logits[mask_index]
-                    confidence, x0 = sample_tokens(mask_logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True)
+                    if dual_cache:
+                        full_confidence = torch.full_like(x_slice, -torch.inf, device=self.device, dtype=logits.dtype)
+                    else:
+                        full_confidence = torch.full_like(x_slice, -torch.inf, device=self.device, dtype=logits.dtype)
+                    full_confidence[mask_index] = confidence_full[mask_index]
+                    full_confidence[:, block_length:] = -torch.inf
+                    x_slice[~mask_index] = x0_full[~mask_index]
                     num_mask_token = mask_index.sum() / mask_index.shape[0]
                     number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps_per_block - 1 else int(num_mask_token)
-                    if dual_cache:
-                        full_confidence = torch.full_like(x[:, current_block_start:current_block_end], -torch.inf, device=self.device, dtype=logits.dtype)
-                    else:
-                        full_confidence = torch.full_like(x[:, current_block_start:], -torch.inf, device=self.device, dtype=logits.dtype)
-                    full_confidence[mask_index] = confidence
-                    full_confidence[:, block_length:] = -torch.inf
-                    
                     if number_transfer_tokens > 0:
                         if alg_temp is None or alg_temp == 0:
                             _, transfer_index = torch.topk(full_confidence, number_transfer_tokens)
@@ -572,19 +592,28 @@ class DreamGenerationMixin:
                             full_confidence = full_confidence / alg_temp
                             full_confidence = F.softmax(full_confidence, dim=-1)
                             transfer_index = torch.multinomial(full_confidence, num_samples=number_transfer_tokens)
-                        if dual_cache:
-                            x_ = torch.zeros_like(x[:, current_block_start:current_block_end], device=self.device, dtype=torch.long) + mask_token_id
-                        else:
-                            x_ = torch.zeros_like(x[:, current_block_start:], device=self.device, dtype=torch.long) + mask_token_id
-                        x_[mask_index] = x0.clone()
                         row_indices = torch.arange(x.size(0), device=self.device).unsqueeze(1).expand_as(transfer_index)
-                        if dual_cache:
-                            x[:, current_block_start:current_block_end][row_indices,transfer_index] = x_[row_indices,transfer_index]
-                        else:
-                            x[:, current_block_start:][row_indices,transfer_index] = x_[row_indices,transfer_index]
+                        x_slice[row_indices, transfer_index] = x0_full[row_indices, transfer_index]
                     i += 1
 
                 x = generation_tokens_hook_func(step_idx, x, full_logits)
+                # --- Detailed step logging (block, diffusion steps within block) ---
+                if detailed_log and tokenizer is not None and x.shape[0] > 0:
+                    mask_id = mask_token_id.item() if isinstance(mask_token_id, torch.Tensor) else mask_token_id
+                    b_idx = 0
+                    logger.info(f"=== Block {num_block} Step {step_idx} (after update) [slice len {logits_len}] ===")
+                    logger.info(f"{'Pos':<6} | {'Sampled':<20} | {'Updated':<20} | {'Confidence':<10} | {'Changed':<6}")
+                    logger.info("-" * 75)
+                    for local_pos in range(logits_len):
+                        global_pos = current_block_start + local_pos
+                        sampled_id = x0_full[b_idx, local_pos].item()
+                        updated_id = x[b_idx, global_pos].item()
+                        conf = confidence_full[b_idx, local_pos].item()
+                        s_sampled = tokenizer.decode([sampled_id]) if sampled_id != mask_id else "<MASK>"
+                        s_updated = tokenizer.decode([updated_id]) if updated_id != mask_id else "<MASK>"
+                        changed = "Yes" if sampled_id != updated_id else "No"
+                        logger.info(f"{global_pos:<6} | {s_sampled[:18]:<20} | {s_updated[:18]:<20} | {conf:.4f}     | {changed:<6}")
+                    logger.info("=" * 75)
                 step_idx += 1
                 if (x[:, current_block_start:current_block_end] == mask_token_id).sum() == 0:
                     break

@@ -241,7 +241,7 @@ class DreamGenerationConfig(GenerationConfig):
                     raise err
         self.validate(is_init=True)
 
-    def validate(self, is_init=False):
+    def validate(self, is_init=False, **kwargs):
         pass
 
 

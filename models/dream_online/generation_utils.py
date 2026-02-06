@@ -147,7 +147,7 @@ class DreamGenerationConfig(GenerationConfig):
         # Validate the values of the attributes
         self.validate(is_init=True)
 
-    def validate(self, is_init=False):
+    def validate(self, is_init=False, **kwargs):
         pass
 
 class DreamGenerationMixin:
@@ -355,6 +355,8 @@ class DreamGenerationMixin:
             attention_mask=attention_mask 
         )
         threshold = kwargs.get("threshold", 0.9)
+        tokenizer = kwargs.pop("tokenizer", None)
+        detailed_log = kwargs.pop("detailed_log", False)
 
         result = self._sample(
             input_ids,
@@ -362,7 +364,9 @@ class DreamGenerationMixin:
             generation_config=generation_config,
             generation_tokens_hook_func=generation_tokens_hook_func,
             generation_logits_hook_func=generation_logits_hook_func,
-            threshold=threshold
+            threshold=threshold,
+            tokenizer=tokenizer,
+            detailed_log=detailed_log,
         )
         return result
 
@@ -373,7 +377,9 @@ class DreamGenerationMixin:
         generation_config: DreamGenerationConfig,
         generation_tokens_hook_func,
         generation_logits_hook_func,
-        threshold: Optional[float] = 0.9
+        threshold: Optional[float] = 0.9,
+        tokenizer=None,
+        detailed_log: bool = False,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
         output_history = generation_config.output_history
@@ -488,6 +494,24 @@ class DreamGenerationMixin:
 
             # this allows user-defined token control of the intermediate steps
             x = generation_tokens_hook_func(i, x, logits)
+
+            # --- Detailed step logging (like sft_dream_chat supervision log) ---
+            # NOTE: use print so logs always go to stdout (and your output.log if stdout is redirected).
+            if detailed_log and tokenizer is not None and x.shape[0] > 0:
+                mask_id = mask_token_id.item() if isinstance(mask_token_id, torch.Tensor) else mask_token_id
+                b_idx = 0
+                seq_len = x.shape[1]
+                print(f"=== Diffusion Step {i} (after update) ===")
+                print(f"{'Pos':<6} | {'Sampled':<20} | {'Updated':<20} | {'Confidence':<10}")
+                print("-" * 75)
+                for pos in range(seq_len):
+                    sampled_id = x0_full[b_idx, pos].item()
+                    updated_id = x[b_idx, pos].item()
+                    conf = confidence_full[b_idx, pos].item()
+                    s_sampled = tokenizer.decode([sampled_id]) if sampled_id != mask_id else "<|MASK|>"
+                    s_updated = tokenizer.decode([updated_id]) if updated_id != mask_id else "<|MASK|>"
+                    print(f"{pos:<6} | {s_sampled[:18]:<20} | {s_updated[:18]:<20} | {conf:.4f}")
+                print("=" * 75)
 
             if histories is not None:
                 histories.append(x.clone())
