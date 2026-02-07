@@ -336,7 +336,6 @@ class DreamGenerationMixin:
         self,
         inputs: Optional[torch.Tensor] = None,
         generation_config: Optional[DreamGenerationConfig] = None,
-        tokenizer = None,
         **kwargs,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
@@ -390,6 +389,7 @@ class DreamGenerationMixin:
             attention_mask=attention_mask 
         )
         threshold = kwargs.get("threshold", 0.9)
+        tokenizer = kwargs.pop("tokenizer", None)
 
         result = self._sample(
             input_ids,

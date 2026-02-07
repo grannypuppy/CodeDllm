@@ -25,6 +25,7 @@ from accelerate.utils import DistributedType, set_seed
 
 
 from models import DreamTokenizer, DreamModel
+from models.dream_online.generation_utils_ast import sample_tokens, extract_code_from_output
 from models.lr_schedulers import get_scheduler
 from models.logging import set_verbosity_info, set_verbosity_error
 
@@ -42,19 +43,38 @@ try:
 except ImportError:
     is_apex_available = False
 
+try:
+    from utils.ast_dag import generate_char_weights_from_dag
+except ImportError:
+    generate_char_weights_from_dag = None
+
 logger = get_logger(__name__, log_level="INFO")
 
+# Online training: diffusion step counts for round-robin. Each seq runs once; steps cycle [16, 32, 64, 128, 16, 32, ...].
+TOTAL_STEPS_SETTING = [8, 16, 32]
+# Diffusion params (align with gen_eval.sh / gen_eval_online.py: top_p=0.9, temperature=0.1)
+DIFFUSION_EPS = 1e-3
+DIFFUSION_ALG = "entropy"
+DIFFUSION_ALG_TEMP = 0.1
+DIFFUSION_TEMPERATURE = 0.1
+DIFFUSION_TOP_P = 0.9
+DIFFUSION_TOP_K = None
+DIFFUSION_THRESHOLD = None
 
+# Loss mode: True = grouped loss (normal + pad_group, same as sft_dream_chat 668-705); False = simple mean over response segment (same as chat else branch)
+USE_GROUPED_LOSS = True
 
-
+# True = 每个 diffusion step 后打印 Pos | Sampled | Updated | Confidence | Target（与 generation_utils_ast 一致，标题带 [AST]，多一列 ground truth）
+DETAILED_STEP_LOG = False
 
 
 
 class TrainDataset(Dataset):
-    def __init__(self, inputs, labels, pmasks, start_pos):
+    """Online training: each item is (input_ids, labels, start_pos). No p_mask."""
+
+    def __init__(self, inputs, labels, start_pos):
         self.inputs = inputs
         self.labels = labels
-        self.pmasks = pmasks
         self.start_pos = start_pos
 
     def __len__(self):
@@ -64,8 +84,7 @@ class TrainDataset(Dataset):
         return (
             self.inputs[idx],
             self.labels[idx],
-            self.pmasks[idx],
-            self.start_pos[idx]
+            self.start_pos[idx],
         )
 
 
@@ -241,55 +260,52 @@ def main():
 
     
     @torch.no_grad()
-    def prepare_inputs_and_labels_for_text(
-        input_list, target_list, step_map_list, eps=1e-3, mask_id=mask_id
-    ):
-        # Templates
-        src_code_prompts_template = '''Below is a program. Optimize the program and provide a faster version.\nProgram:\n ```python\n{{src_code}}\n```'''
+    def prepare_inputs_and_labels_online(input_list, target_list, mask_id=mask_id):
+        """Online training: strictly same padding as sft_dream_dataset_m.prepare_inputs_and_labels_for_text.
+        Order and values: build curr_input_ids/curr_labels per sample, then right-pad to max_len.
+        Input = prompt + [MASK]*len(response); labels = -100*prompt + response.
+        Right pad: input 补 pad_id, labels 补 pad_id（与 dataset_m 一致；pad 区域可被 mask 并参与 loss）.
+        """
+        src_code_prompts_template = '''Below is a program. Optimize the program and provide a faster version.\nProgram:\n```python\n{{src_code}}\n```'''
         eos_token = tokenizer.eos_token
         tgt_code_response_template = '''Here is the optimized code:\n```python\n{{tgt_code}}\n```''' + eos_token
         pad_id = tokenizer.pad_token_id
-        
         max_prompt_len = config.training.max_prompt_len
         max_gen_length = config.training.max_gen_length
-        
-        # Custom Right-Padding Logic
+
+        # Same order as dataset_m: list per sample first
         input_ids_lm = []
         labels_lm = []
         start_pos_list = []
         keep_indices = []
-        batch_response_lens = []
 
         for i, (inp, tgt) in enumerate(zip(input_list, target_list)):
-            # Tokenize Prompt
             prompt_text = [{"role": "user", "content": src_code_prompts_template.replace("{{src_code}}", inp)}]
             prompt_ids = tokenizer.apply_chat_template(prompt_text, add_generation_prompt=True, tokenize=True, add_special_tokens=False)
-            
             if len(prompt_ids) > max_prompt_len:
                 continue
-            
+
             response_ids = tokenizer(tgt_code_response_template.replace("{{tgt_code}}", tgt), add_special_tokens=False).input_ids
-            
             if len(response_ids) > max_gen_length:
                 response_ids = response_ids[:max_gen_length]
 
-            curr_input_ids = prompt_ids + response_ids
+            # Same as dataset_m: curr_input_ids = prompt + content_region; curr_labels = -100*prompt + content_region.
+            # Online: content_region in input is MASK*len(response); in labels is response_ids.
+            curr_input_ids = prompt_ids + [mask_id] * len(response_ids)
             curr_labels = [-100] * len(prompt_ids) + response_ids
-            
+
             input_ids_lm.append(torch.tensor(curr_input_ids))
             labels_lm.append(torch.tensor(curr_labels))
             start_pos_list.append(len(prompt_ids))
             keep_indices.append(i)
-            batch_response_lens.append(len(response_ids))
 
         drop_num = len(input_list) - len(keep_indices)
-        
         if not input_ids_lm:
              raise ValueError("No valid data found in the batch")
 
         # Right Padding
         max_len = max([x.size(0) for x in input_ids_lm])
-        
+
         padded_inputs = []
         padded_labels = []
         
@@ -297,8 +313,7 @@ def main():
             rem = max_len - input_ids_lm[i].size(0)
             if rem > 0:
                 r_pad = torch.full((rem,), pad_id, dtype=torch.long)
-                r_lbl = torch.full((rem,), pad_id, dtype=torch.long)
-                
+                r_lbl = torch.full((rem,), pad_id, dtype=torch.long)                
                 padded_inputs.append(torch.cat([input_ids_lm[i], r_pad]))
                 padded_labels.append(torch.cat([labels_lm[i], r_lbl]))
             else:
@@ -307,189 +322,28 @@ def main():
 
         input_ids_lm = torch.stack(padded_inputs)
         labels_lm = torch.stack(padded_labels)
-        
-        logger.info(f"input_ids: {input_ids_lm[2]}")
-        logger.info(f"input_tokens: {tokenizer.decode(input_ids_lm[2], skip_special_tokens=True)}")
-        logger.info(f"labels: {labels_lm[2]}")
-        logger.info(f"start_pos: {start_pos_list[2]}; input_tokens_at_start_pos: {tokenizer.decode(input_ids_lm[2][start_pos_list[2]], skip_special_tokens=True)}")
-        # Step Map filtering
-        step_map_list = [step_map_list[i] for i in keep_indices]
-        
-        batch_step_map = []
-        for i, stp in enumerate(step_map_list):
-            resp_len = batch_response_lens[i]
-            current_step_map = stp[:] if stp else []
-             
-            if len(current_step_map) < resp_len:
-                last_step = current_step_map[-1] if current_step_map else -1
-                needed = resp_len - len(current_step_map)
-                current_step_map.extend([last_step + 1 + k for k in range(needed)])
-             
-            current_step_map = current_step_map[:resp_len]
-            batch_step_map.append(current_step_map)
-             
-        # Masking Logic
-        pad_id = tokenizer.pad_token_id
-        B, L_after = input_ids_lm.shape
-        device = input_ids_lm.device
-        
-        lower = config.training.lower_p
-        upper = config.training.upper_p
-        
-        if config.training.method == "semi-ar":
-
-            noisy_list, label_list, pmask_list = [], [], []
-            start_pos_out_list = []
-            
-            for b in range(B):
-                current_start_pos = start_pos_list[b]
-                order_list = list(batch_step_map[b])
-                order_list = collapse_k_unique(order_list, config.training.block_size)
-                order = torch.as_tensor(order_list, device=device)
-                
-                order_full = torch.full((L_after,), -1, device=device)
-                resp_len = len(order)
-                order_full[current_start_pos : current_start_pos + resp_len] = order
-                
-                uniq_steps = torch.unique(order_full[current_start_pos:], sorted=True)
-                uniq_steps = uniq_steps[uniq_steps != -1]
-
-                base_ids = input_ids_lm[b]
-
-                for i in range(0, len(uniq_steps)):
-                    block_mask = (order_full == uniq_steps[i])
-                    p = torch.empty(L_after, device=device).uniform_(lower, upper)
-                    block_mask = (torch.rand(L_after, device=device) < p) & block_mask
-                    
-                    noisy_ids = base_ids.clone()
-                    mask_pos  = (order_full > uniq_steps[i]) | block_mask
-                    noisy_ids[mask_pos] = mask_id
-                    
-                    pmask_this = block_mask # & ~tail_pad_b
-
-                    if not pmask_this.any():
-                        continue
-
-                    noisy_list.append(noisy_ids)
-                    label_list.append(labels_lm[b])
-                    pmask_list.append(pmask_this)
-                    start_pos_out_list.append(current_start_pos)
-
-            if noisy_list:
-                noisy_batch = torch.stack(noisy_list)
-                labels_lm   = torch.stack(label_list)
-                p_mask      = torch.stack(pmask_list)
-                start_pos_list = torch.tensor(start_pos_out_list, device=device)
-            else:
-                raise ValueError("No valid data found in the batch")
-        
-        elif config.training.method == "ar":
-            
-            noisy_batch = input_ids_lm
-            labels_lm   = input_ids_lm
-            start_pos_list = torch.tensor(start_pos_list, device=device)
-            
-            p_mask_list = []
-            for b in range(B):
-                current_start_pos = start_pos_list[b]
-                pm = torch.zeros(L_after, dtype=torch.bool, device=device)
-                pm[current_start_pos:] = True
-                
-                p_mask_list.append(pm)
-            p_mask = torch.stack(p_mask_list)
-        
-        elif config.training.method == "random_masking":
-            m = config.training.mask_times_per_sample
-            
-            noisy_list, label_list, pmask_list = [], [], []
-            start_pos_out_list = []
-            for b in range(B):
-                base_ids  = input_ids_lm[b]
-                label_ids = labels_lm[b]
-                current_start_pos = start_pos_list[b]
-
-                for _ in range(m):
-                    t = (upper - lower) * torch.rand(1, device=device) + lower
-                    rand_mask = torch.rand(L_after, device=device) < t
-                    rand_mask[:current_start_pos] = False
-                    rand_mask = rand_mask # & ~tail_pad_b
-
-                    if not rand_mask.any():
-                        continue
-
-                    noisy_ids = base_ids.clone()
-                    noisy_ids[rand_mask]   = mask_id
-
-                    noisy_list.append(noisy_ids)
-                    label_list.append(labels_lm[b])
-                    pmask_list.append(rand_mask)
-                    start_pos_out_list.append(current_start_pos)
-
-                # Add full mask sample (mask all non-prompt tokens)
-                full_mask = torch.ones(L_after, dtype=torch.bool, device=device)
-                full_mask[:current_start_pos] = False
-                
-                if full_mask.any():
-                    noisy_ids_full = base_ids.clone()
-                    noisy_ids_full[full_mask] = mask_id
-                    
-                    noisy_list.append(noisy_ids_full)
-                    label_list.append(labels_lm[b])
-                    pmask_list.append(full_mask)
-                    start_pos_out_list.append(current_start_pos)
-
-            noisy_batch = torch.stack(noisy_list)
-            labels_lm   = torch.stack(label_list)
-            p_mask      = torch.stack(pmask_list)
-            start_pos_list = torch.tensor(start_pos_out_list, device=device)
-
-        # Filter valid rows (needed for Semi-AR and Random Masking)
-        if config.training.method != "ar":
-             valid_rows = p_mask.any(dim=1)
-             noisy_batch = noisy_batch[valid_rows]
-             labels_lm   = labels_lm[valid_rows]
-             p_mask      = p_mask[valid_rows]
-             start_pos_list = start_pos_list[valid_rows]
-            
-        return noisy_batch, labels_lm, p_mask, start_pos_list, drop_num
-        
+        start_pos_list = torch.tensor(start_pos_list, dtype=torch.long)
+        return input_ids_lm, labels_lm, start_pos_list, drop_num
 
     def simple_collate(batch):
-        inp, lbl, msk, spos = zip(*batch)
-        res = {
-            "input_ids":  torch.stack(inp),
-            "labels":     torch.stack(lbl),
-            "p_mask_lm":  torch.stack(msk),
-            "start_pos":  torch.tensor(spos)
+        inp, lbl, spos = zip(*batch)
+        return {
+            "input_ids": torch.stack(inp),
+            "labels": torch.stack(lbl),
+            "start_pos": torch.stack(spos) if isinstance(spos[0], torch.Tensor) else torch.tensor(spos),
         }
-        return res
     
 
     
     with open("./data/" + config.dataset.optimization_data, 'r') as f:
         dataset_load = json.load(f)
     dataset_load = dataset_load[:1000]
-    
-    input_list = []
-    target_list = []
-    step_map_list = []
 
-    for x in dataset_load:
-        input_list.append(x["input"])   # Use 'input' as prompt (src_code)
-        target_list.append(x["target"]) # Use 'target' as target (tgt_code)
-        if "step_map" not in x.keys():
-            step_map_list.append([j for j in range(config.training.max_gen_length)])
-        else:
-            step_map_list.append(x["step_map"])
-        # target_tokens_list no longer needed for alignment, but we keep loop structure
-       
-    # Call new prepare function with lists
-    input_ids, labels, p_mask_lm, start_pos, drop_num = prepare_inputs_and_labels_for_text(
-        input_list, target_list, step_map_list
-    )
+    input_list = [x["input"] for x in dataset_load]
+    target_list = [x["target"] for x in dataset_load]
 
-    
-    dataset_lm = TrainDataset(input_ids, labels, p_mask_lm, start_pos)
+    input_ids, labels, start_pos, drop_num = prepare_inputs_and_labels_online(input_list, target_list)
+    dataset_lm = TrainDataset(input_ids, labels, start_pos)
 
     # --- Validation Data Loading ---
     eval_dataloader = None
@@ -497,37 +351,23 @@ def main():
         logger.info(f"Loading validation data from {config.dataset.validation_data}")
         with open("./data/" + config.dataset.validation_data, 'r') as f:
             val_dataset_load = json.load(f)
-        # Optional: limit validation size for speed
         val_dataset_load = val_dataset_load[-50:]
-        
-        val_input_list = []
-        val_target_list = []
-        val_step_map_list = []
-
-        for x in val_dataset_load:
-            val_input_list.append(x["input"])
-            val_target_list.append(x["target"])
-            if "step_map" not in x.keys():
-                val_step_map_list.append([j for j in range(config.training.max_gen_length)])
-            else:
-                val_step_map_list.append(x["step_map"])
-        
-        val_input_ids, val_labels, val_p_mask_lm, val_start_pos, val_drop_num = prepare_inputs_and_labels_for_text(
-            val_input_list, val_target_list, val_step_map_list
-        )
-        
-        dataset_val = TrainDataset(val_input_ids, val_labels, val_p_mask_lm, val_start_pos)
-        
+        val_input_list = [x["input"] for x in val_dataset_load]
+        val_target_list = [x["target"] for x in val_dataset_load]
+        val_input_ids, val_labels, val_start_pos, _ = prepare_inputs_and_labels_online(val_input_list, val_target_list)
+        dataset_val = TrainDataset(val_input_ids, val_labels, val_start_pos)
         eval_dataloader = DataLoader(
             dataset_val,
             batch_size=config.training.batch_size_lm,
             sampler=None,
             collate_fn=simple_collate,
-            num_workers=0
+            num_workers=0,
         )
     # -------------------------------
     
     total_batch_size_lm = config.training.batch_size_lm * accelerator.num_processes * config.training.gradient_accumulation_steps
+    # Online: one run per seq, steps round-robin from TOTAL_STEPS_SETTING (seq0→16, seq1→32, seq2→64, seq3→128, seq4→16, ...)
+    num_logic_samples_per_step = config.training.batch_size_lm
     num_update_steps_per_epoch = math.ceil(len(dataset_lm) / total_batch_size_lm)
     num_train_epochs = config.training.num_train_epochs
     max_train_steps = num_update_steps_per_epoch * num_train_epochs + 1
@@ -578,6 +418,7 @@ def main():
     # Load full training state when resuming (optimizer, scheduler, RNG; model/tokenizer already loaded from load_path)
     first_epoch = 0
     global_step = 0
+    steps_setting_idx = 0  # Online: round-robin index for TOTAL_STEPS_SETTING
     if resume_from_checkpoint:
         accelerator.load_state(str(resume_from_checkpoint))
         trainer_state_path = Path(resume_from_checkpoint) / "trainer_state.json"
@@ -586,7 +427,8 @@ def main():
                 trainer_state = json.load(f)
             global_step = int(trainer_state.get("global_step", 0))
             first_epoch = int(trainer_state.get("epoch", 0))
-            logger.info(f"Resumed training state: global_step={global_step}, epoch={first_epoch}")
+            steps_setting_idx = int(trainer_state.get("steps_setting_idx", 0))
+            logger.info(f"Resumed training state: global_step={global_step}, epoch={first_epoch}, steps_setting_idx={steps_setting_idx}")
         else:
             logger.warning(f"No trainer_state.json in {resume_from_checkpoint}; starting from global_step=0, epoch=0")
 
@@ -602,6 +444,7 @@ def main():
     logger.info(f"  Instantaneous batch size per device = {config.training.batch_size_lm}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size_lm}")
     logger.info(f"  Gradient Accumulation steps = {config.training.gradient_accumulation_steps}")
+    logger.info(f"  Online: TOTAL_STEPS_SETTING = {TOTAL_STEPS_SETTING}, logic samples per step = {num_logic_samples_per_step}")
 
     data_time_m = AverageMeter()
     end = time.time()
@@ -631,117 +474,239 @@ def main():
         device = input_ids.device
         bias = torch.zeros(B, 1, 1, T, device=device)
         return bias
-    
 
-    
-    def forward_process(input_ids, labels, p_mask_lm, start_pos):
-        if config.training.method == "ar":
-            #if config.training.batch_size_lm == 1:
-            #    logits = model(input_ids, is_causal=True).logits
-            attn_mask = make_causal_attention_mask(input_ids)
-            logits = model(input_ids, attention_mask=attn_mask, is_causal=False).logits
+    def _apply_ast_confidence_weighting(confidence_full, x_next, mask_index, x0_full, tokenizer, start_pos_1d, extract_code_from_output_fn, generate_char_weights_from_dag_fn):
+        """Same logic as generation_utils_ast: reweight confidence_full for mask positions in code region by AST depth. Modifies confidence_full in place."""
+        if tokenizer is None or start_pos_1d is None or generate_char_weights_from_dag_fn is None or extract_code_from_output_fn is None:
+            return
+        try:
+            x_temp = x_next.clone()
+            x_temp[mask_index] = x0_full[mask_index]
+            for b in range(x_next.shape[0]):
+                prompt_len = start_pos_1d[b].item()
+                full_text = tokenizer.decode(x_temp[b], skip_special_tokens=True)
+                generated_text = tokenizer.decode(x_temp[b][prompt_len:], skip_special_tokens=True)
+                code_text = extract_code_from_output_fn(generated_text)
+                if code_text:
+                    raw_char_weights = generate_char_weights_from_dag_fn(code_text)
+                    if raw_char_weights is not None:
+                        depths_array = np.array(raw_char_weights, dtype=float)
+                        max_depth = np.max(depths_array)
+                        inverted_depths = 1 + max_depth - depths_array
+                        inverted_depths = inverted_depths / inverted_depths.mean()
+                        full_text_reconstructed = ""
+                        start_idx = generated_text.find(code_text)
+                        if start_idx != -1:
+                            end_idx = start_idx + len(code_text)
+                            token_ids_list = x_temp[b].tolist()
+                            b_mask = mask_index[b]
+                            current_mask_indices = torch.nonzero(b_mask, as_tuple=False).squeeze(-1)
+                            if current_mask_indices.dim() == 0:
+                                current_mask_indices = current_mask_indices.unsqueeze(0)
+                            mean_conf = confidence_full[b][mask_index[b]].mean().item()
+                            for j, token_id in enumerate(token_ids_list[prompt_len:]):
+                                token_idx = prompt_len + j
+                                token_str = tokenizer.decode([token_id])
+                                tok_start = len(full_text_reconstructed)
+                                tok_end = tok_start + len(token_str)
+                                full_text_reconstructed += token_str
+                                overlap_start = max(tok_start, start_idx)
+                                overlap_end = min(tok_end, end_idx)
+                                if overlap_start < overlap_end and (current_mask_indices == token_idx).any().item():
+                                    local_start = overlap_start - start_idx
+                                    local_end = overlap_end - start_idx
+                                    relevant_weights = inverted_depths[local_start:local_end]
+                                    if len(relevant_weights) > 0:
+                                        token_weight = float(np.max(relevant_weights))
+                                        old_c = confidence_full[b, token_idx].item()
+                                        confidence_full[b, token_idx] = mean_conf + token_weight * (old_c - mean_conf)
+        except Exception as e:
+            logger.warning(f"AST Weighted Remasking failed: {e}")
+
+    @torch.no_grad()
+    def diffusion_step_update(x, logits, i, steps, timesteps, mask_token_id, alg, alg_temp, temperature, top_p, top_k, threshold, device, state=None, tokenizer=None, start_pos_1d=None, extract_code_from_output_fn=None, generate_char_weights_from_dag_fn=None):
+        """Update x for next diffusion step. Same logic as generation_utils._sample (while loop body). No grad.
+        Returns (state, x0_full, confidence_full, x_next). Must return a new tensor x_next instead of modifying x
+        in place, so that x (used in model(x) for this step) is not altered and backward() can compute gradients."""
+        x_next = x.clone()  # 不在原 x 上 inplace 修改，否则 backward 会报 "modified by an inplace operation"
+        mask_index = (x_next == mask_token_id)
+        logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+        confidence_full, x0_full = sample_tokens(
+            logits, temperature=temperature, top_p=top_p, top_k=top_k,
+            margin_confidence=(alg == 'topk_margin'), neg_entropy=(alg == 'entropy')
+        )
+        if not alg == 'confidence_threshold':
+            t = timesteps[i]
+            s = timesteps[i + 1]
+
+        if alg == 'origin':
+            p_transfer = 1 - s / t if i < steps - 1 else 1
+            x0 = torch.zeros_like(x_next[mask_index], device=device, dtype=torch.long) + mask_token_id
+            transfer_index_t_s = torch.rand(*x0.shape, device=device) < p_transfer
+            x0[transfer_index_t_s] = x0_full[mask_index][transfer_index_t_s]
+            x_next[mask_index] = x0.clone()
+            x_next[~mask_index] = x0_full[~mask_index]
+        elif alg == 'confidence_threshold':
+            _apply_ast_confidence_weighting(confidence_full, x_next, mask_index, x0_full, tokenizer, start_pos_1d, extract_code_from_output_fn, generate_char_weights_from_dag_fn)
+            number_transfer_tokens = state["number_transfer_tokens"]
+            left_tokens_last_step = state["left_tokens_last_step"]
+            full_confidence = torch.full_like(x_next, -torch.inf, device=device, dtype=logits.dtype)
+            full_confidence[mask_index] = confidence_full[mask_index]
+            current_transfer_tokens = number_transfer_tokens + left_tokens_last_step
+            state["left_tokens_last_step"] = 0
+            selected_confidence, select_index = torch.topk(full_confidence, current_transfer_tokens)
+            transfer_index = torch.zeros_like(x_next, device=x_next.device, dtype=torch.bool)
+            select_index = select_index.to(x_next.device)
+            transfer_index[0, select_index[0]] = True
+            for k in range(1, current_transfer_tokens):
+                if selected_confidence[0, k] < threshold:
+                    if i < steps - 1:
+                        state["left_tokens_last_step"] += 1
+                        transfer_index[0, select_index[0, k]] = False
+                    else:
+                        state["number_transfer_tokens"] = 0
+                        state["steps"] = state.get("steps", steps) + 1
+                        state["left_tokens_last_step"] += 1
+                        transfer_index[0, select_index[0, k]] = False
+            x_next[~mask_index] = x0_full[~mask_index]
+            x_next[transfer_index] = x0_full[transfer_index]
         else:
-            attention_mask = make_attention_mask(input_ids)
-            logits = model(input_ids=input_ids, attention_mask=attention_mask, is_causal=False).logits
-        
-        B, T, V = logits.shape
+            if alg not in ('maskgit_plus', 'topk_margin', 'entropy'):
+                raise RuntimeError(f"Unknown alg: {alg}")
+            _apply_ast_confidence_weighting(confidence_full, x_next, mask_index, x0_full, tokenizer, start_pos_1d, extract_code_from_output_fn, generate_char_weights_from_dag_fn)
+            num_mask_token = mask_index.sum() / mask_index.shape[0]
+            number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps - 1 else int(num_mask_token)
+            full_confidence = torch.full_like(x_next, -torch.inf, device=device, dtype=logits.dtype)
+            full_confidence[mask_index] = confidence_full[mask_index]
+            x_next[~mask_index] = x0_full[~mask_index]
+            if number_transfer_tokens > 0:
+                if alg_temp is None or alg_temp == 0:
+                    _, transfer_index = torch.topk(full_confidence, number_transfer_tokens)
+                else:
+                    full_confidence = full_confidence / alg_temp
+                    full_confidence = F.softmax(full_confidence, dim=-1)
+                    transfer_index = torch.multinomial(full_confidence, num_samples=number_transfer_tokens)
+                row_indices = torch.arange(x_next.size(0), device=device).unsqueeze(1).expand_as(transfer_index)
+                x_next[row_indices, transfer_index] = x0_full[row_indices, transfer_index]
+        return state, x0_full, confidence_full, x_next
 
-        shift_mask   = p_mask_lm[:, 1:]
-        shift_logits = logits[:, :-1, :]
-        shift_labels = labels[:, 1:]
+    def online_diffusion_forward(input_ids, labels, start_pos, steps, mask_id, pad_id):
+        """One diffusion run: align with inference loop; at each step compute loss on response vs GT.
+        Supports per-sample start_pos (same as sft_dream_chat / sft_dream_dataset_m).
+        """
+        device = input_ids.device
+        B, max_length = input_ids.shape
+        start_pos_1d = start_pos.view(-1)  # (B,)
 
-        # Create safe labels for gather, replacing -100 with 0
-        safe_labels = shift_labels.clone()
-        safe_labels[safe_labels == -100] = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        x = input_ids.clone()
+        attention_mask = make_attention_mask(x)
+        tok_idx = None
+        timesteps = torch.linspace(1, DIFFUSION_EPS, steps + 1, device=device)
 
-        log_probs = F.log_softmax(shift_logits, dim=-1)                             # (B, T-1, V)
-        logp_tok  = log_probs.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)     # (B, T-1)
-        
-        if False:
-            shift_inputs = input_ids[:, 1:]
-            # --- Enhanced Logging Start ---
-            # Only log for the first sample in the batch to avoid clutter
-            b_idx = 0
-            logger.info(f"=== Detailed Supervision for Batch Sample {b_idx} ===")
-            
-            # 1. Input Tokens
-            input_tokens_str = tokenizer.decode(input_ids[b_idx], skip_special_tokens=False)
-            logger.info(f"Full Input Sequence: {input_tokens_str}")
-            logger.info(f"Input IDs: {input_ids[b_idx].tolist()}")
-
-            # 2. Predictions vs Targets
-            # Get predicted token ids (argmax)
-            pred_ids = torch.argmax(shift_logits[b_idx], dim=-1) # (T-1)
-            
-            # Iterate over sequence
-            seq_len = T - 1
-            logger.info(f"{'Pos':<5} | {'Input':<15} | {'Target':<15} | {'Pred':<15} | {'Tgt Prob':<10} | {'Mask':<5}")
-            logger.info("-" * 80)
-            
-            for t in range(seq_len):
-                curr_input_id = shift_inputs[b_idx, t].item()
-                curr_target_id = shift_labels[b_idx, t].item()
-                curr_pred_id = pred_ids[t].item()
-                curr_mask = shift_mask[b_idx, t].item()
-                curr_prob = torch.exp(logp_tok[b_idx, t]).item()
-                
-                # Decode
-                s_input = tokenizer.decode([curr_input_id])
-                s_target = tokenizer.decode([curr_target_id]) if curr_target_id != -100 else "<IGNORE>"
-                s_pred = tokenizer.decode([curr_pred_id])
-
-                logger.info(f"{t:<5} | {s_input:<15} | {s_target:<15} | {s_pred:<15} | {curr_prob:.4f}     | {curr_mask:<5}")
-                
-            logger.info("=" * 50)
-            # --- Enhanced Logging End ---
-        
-        if True:
-            # --- Modified Loss Calculation Start ---
-            token_losses = -logp_tok
-            
-            B_size, T_minus_1 = shift_labels.shape
-            device = shift_labels.device
-            
-            indices = torch.arange(T_minus_1, device=device).unsqueeze(0).expand(B_size, -1)
-            
-            # Find last non-pad token
-            is_non_pad = (shift_labels != pad_id)
-            # Use a large negative number for pad positions so max picks the last non-pad index
-            non_pad_indices = torch.where(is_non_pad, indices, torch.tensor(-1, device=device))
-            last_non_pad_idx = non_pad_indices.max(dim=1).values
-            
-            cutoff_idx = last_non_pad_idx + 1
-            
-            is_normal_mask = indices <= cutoff_idx.unsqueeze(1)
-            is_pad_group_mask = indices > cutoff_idx.unsqueeze(1)
-            
-            final_normal_mask = shift_mask & is_normal_mask
-            final_pad_group_mask = shift_mask & is_pad_group_mask
-            
-            loss_normal_sum = (token_losses * final_normal_mask).sum(dim=1)
-            count_normal = final_normal_mask.sum(dim=1)
-            
-            loss_pad_group_sum = (token_losses * final_pad_group_mask).sum(dim=1)
-            count_pad_group = final_pad_group_mask.sum(dim=1)
-            
-            avg_pad_loss = torch.zeros_like(loss_pad_group_sum)
-            has_pad_group = count_pad_group > 0
-            avg_pad_loss[has_pad_group] = loss_pad_group_sum[has_pad_group] / count_pad_group[has_pad_group]
-            
-            total_seq_loss = loss_normal_sum + avg_pad_loss
-            total_seq_count = count_normal + has_pad_group.float()
-            
-            loss_per_seq = total_seq_loss / total_seq_count.clamp(min=1)
-            loss_lm = loss_per_seq.sum() / B
-            # --- Modified Loss Calculation End ---
+        if DIFFUSION_ALG == 'confidence_threshold':
+            mask_index_0 = (x == mask_id)
+            assert mask_index_0.sum() % steps == 0, "mask_index.sum() must be divisible by steps"
+            assert x.shape[0] == 1, "batch size must be 1"
+            state = {"number_transfer_tokens": mask_index_0.sum().item() // steps, "left_tokens_last_step": 0, "steps": steps}
         else:
-            loss_lm = - (logp_tok * shift_mask).sum(dim=1)
+            state = None
 
-            mask_num = (shift_mask).sum(dim=1).clamp(min=1)
-            loss_lm = loss_lm / mask_num
-            loss_lm = loss_lm.sum() / B
-        
-        return loss_lm
+        total_loss = 0.0
+        num_steps = 0
+        i = 0
+        current_steps = steps
+        while i < current_steps:
+            logits = model(x, attention_mask, tok_idx).logits
+            logits_shifted = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+            # Per-sample start_pos and gen_length; USE_GROUPED_LOSS ? grouped (sft_dream_chat 668-705) : simple mean (chat else 707-712)
+            step_loss_sum = 0.0
+            for b in range(B):
+                start_pos_b = start_pos_1d[b].item()
+                gen_length_b = max_length - start_pos_b
+                resp_logits_b = logits_shifted[b, start_pos_b : start_pos_b + gen_length_b, :]   # (gen_length_b, V)
+                resp_labels_b = labels[b, start_pos_b : start_pos_b + gen_length_b]              # (gen_length_b,)
+                log_probs_b = F.log_softmax(resp_logits_b, dim=-1)
+                safe_labels_b = resp_labels_b.clone()
+                safe_labels_b[safe_labels_b == -100] = pad_id if pad_id is not None else 0
+                logp_tok_b = log_probs_b.gather(dim=-1, index=safe_labels_b.unsqueeze(-1)).squeeze(-1)  # (gen_length_b,)
+                token_losses_b = -logp_tok_b
+                if USE_GROUPED_LOSS:
+                    # --- Modified Loss Calculation (same as sft_dream_chat 668-705) ---
+                    T_b = resp_labels_b.shape[0]
+                    indices_b = torch.arange(T_b, device=device)
+                    is_non_pad = (resp_labels_b != pad_id)
+                    non_pad_indices = torch.where(is_non_pad, indices_b, torch.tensor(-1, device=device))
+                    last_non_pad_idx = non_pad_indices.max().item()
+                    cutoff_idx = last_non_pad_idx + 1
+                    is_normal_mask = indices_b <= last_non_pad_idx
+                    is_pad_group_mask = indices_b > last_non_pad_idx
+                    final_normal_mask = is_normal_mask
+                    final_pad_group_mask = is_pad_group_mask
+                    loss_normal_sum = (token_losses_b * final_normal_mask.float()).sum()
+                    count_normal = final_normal_mask.sum().float()
+                    loss_pad_group_sum = (token_losses_b * final_pad_group_mask.float()).sum()
+                    count_pad_group = final_pad_group_mask.sum()
+                    has_pad_group = count_pad_group > 0
+                    avg_pad_loss = torch.tensor(0.0, device=device)
+                    if has_pad_group:
+                        avg_pad_loss = loss_pad_group_sum / count_pad_group.float()
+                    total_seq_loss = loss_normal_sum + avg_pad_loss
+                    total_seq_count = count_normal + (1.0 if has_pad_group else 0.0)
+                    loss_per_seq_b = total_seq_loss / total_seq_count.clamp(min=1)
+                else:
+                    # --- Simple mean (same as sft_dream_chat else 707-712) ---
+                    mask_num = token_losses_b.numel()
+                    loss_per_seq_b = token_losses_b.sum() / max(mask_num, 1)
+                step_loss_sum = step_loss_sum + loss_per_seq_b
+            total_loss = total_loss + step_loss_sum / B
+            num_steps += 1
+
+            state, x0_full, confidence_full, x = diffusion_step_update(
+                x, logits, i, current_steps, timesteps, mask_id, DIFFUSION_ALG, DIFFUSION_ALG_TEMP,
+                DIFFUSION_TEMPERATURE, DIFFUSION_TOP_P, DIFFUSION_TOP_K, DIFFUSION_THRESHOLD, device, state,
+                tokenizer=tokenizer,
+                start_pos_1d=start_pos_1d,
+                extract_code_from_output_fn=extract_code_from_output,
+                generate_char_weights_from_dag_fn=generate_char_weights_from_dag,
+            )
+            if state is not None and "steps" in state:
+                current_steps = state["steps"]
+            # 每步后详细 log（与 generation_utils 一致，多一列 Target；pad/eos 等均用 decode，不做特殊打印）；仅 main process 打印
+            if DETAILED_STEP_LOG and accelerator.is_main_process and tokenizer is not None and x0_full is not None and confidence_full is not None:
+                _mask_id = mask_id.item() if isinstance(mask_id, torch.Tensor) else mask_id
+
+                def _cell(s: str, w: int = 10) -> str:
+                    """单行、去换行、截断到 w 个字符，保证表格不对齐乱掉。"""
+                    s = (s or "?").replace("\n", " ").replace("\r", " ").strip()
+                    if len(s) > w:
+                        s = s[:w]
+                    return s.ljust(w)
+
+                for b_idx in range(min(1, B)):  # 只打第一个样本，避免刷屏
+                    start_pos_b = start_pos_1d[b_idx].item()
+                    seq_len = x.shape[1]
+                    W = 13
+                    print(f"\033[32m=== Diffusion Step {i} (after update) [AST] [sample {b_idx}] ===\033[0m")
+                    print(f"{'Pos':<6} | {'Sampled':<{W}} | {'Updated':<{W}} | {'Conf':<8} | {'Target':<{W}}")
+                    print("-" * (6 + 3 + W * 3 + 8 + 3 + W + 12))
+                    for pos in range(seq_len):
+                        sampled_id = x0_full[b_idx, pos].item()
+                        updated_id = x[b_idx, pos].item()
+                        conf = confidence_full[b_idx, pos].item()
+                        s_sampled = tokenizer.decode([sampled_id]) if sampled_id != _mask_id else "<|MASK|>"
+                        s_updated = tokenizer.decode([updated_id]) if updated_id != _mask_id else "<|MASK|>"
+                        # Target: 一律用 decode，不单独处理 pad_id/eos_id；仅 -100 与 prompt 段用占位
+                        label_id = labels[b_idx, pos].item()
+                        if pos < start_pos_b:
+                            s_target = "<prompt>"
+                        elif label_id == -100:
+                            s_target = "<ignore>"
+                        else:
+                            s_target = tokenizer.decode([label_id])
+                        print(f"{pos:<6} | {_cell(s_sampled, W)} | {_cell(s_updated, W)} | {conf:>7.4f} | {_cell(s_target, W)}")
+                    print("=" * (6 + 3 + W * 3 + 8 + 3 + W + 12))
+            i += 1
+        return total_loss / max(num_steps, 1)
 
 
     
@@ -776,65 +741,66 @@ def main():
 
         accumulated_loss = 0.0
         batch_length_list = []
-        mask_num_list = []
+        step_count_list = []
         for step, batch in enumerate(progress_bar, start=1):
 
             data_time_m.update(time.time() - end)
-            
+
             input_ids = batch["input_ids"].to(accelerator.device)
-            labels    = batch["labels"].to(accelerator.device)
-            p_mask_lm = batch["p_mask_lm"].to(accelerator.device)
+            labels = batch["labels"].to(accelerator.device)
             start_pos = batch["start_pos"].to(accelerator.device)
 
-            # Collect metrics
             batch_length_list.append(input_ids.shape[1])
-            mask_num_list.append(p_mask_lm.sum().item())
-
-            loss_lm = forward_process(
-                    input_ids=input_ids,
-                    labels=labels,
-                    p_mask_lm=p_mask_lm,
-                    start_pos=start_pos
+            B = input_ids.shape[0]
+            run_losses = []
+            for b in range(B):
+                steps = TOTAL_STEPS_SETTING[(steps_setting_idx + b) % len(TOTAL_STEPS_SETTING)]
+                run_loss = online_diffusion_forward(
+                    input_ids[b : b + 1],
+                    labels[b : b + 1],
+                    start_pos[b : b + 1] if start_pos.dim() > 0 else start_pos.unsqueeze(0),
+                    steps,
+                    mask_id,
+                    pad_id,
                 )
-            
+                run_losses.append(run_loss)
+                step_count_list.append(steps)
+            steps_setting_idx += B
+            loss_lm = torch.stack(run_losses).mean()
             accumulated_loss += loss_lm.item() / accelerator.gradient_accumulation_steps
             loss_lm = loss_lm / accelerator.gradient_accumulation_steps
             accelerator.backward(loss_lm)
 
             if step % accelerator.gradient_accumulation_steps == 0:
 
-                # --- Validation Loop ---
+                # --- Validation Loop (online: one diffusion run per sample with first step count) ---
                 if eval_dataloader and config.training.get("val_loss_interval", None) and global_step % config.training.val_loss_interval == 0:
                     logger.info(f"Running validation at step {global_step}...")
                     model.eval()
                     total_val_loss = 0.0
                     num_val_batches = 0
-                    
-                    # Disable gradient calculation for validation
+                    val_steps = TOTAL_STEPS_SETTING[0]
                     with torch.no_grad():
                         for val_batch in eval_dataloader:
                             val_input_ids = val_batch["input_ids"].to(accelerator.device)
-                            val_labels    = val_batch["labels"].to(accelerator.device)
-                            val_p_mask_lm = val_batch["p_mask_lm"].to(accelerator.device)
+                            val_labels = val_batch["labels"].to(accelerator.device)
                             val_start_pos = val_batch["start_pos"].to(accelerator.device)
-                            
-                            val_loss = forward_process(
-                                input_ids=val_input_ids,
-                                labels=val_labels,
-                                p_mask_lm=val_p_mask_lm,
-                                start_pos=val_start_pos
-                            )
-                            # Gather loss from all GPUs
-                            gathered_val_loss = accelerator.gather(val_loss).mean()
-                            total_val_loss += gathered_val_loss.item()
-                            num_val_batches += 1
-                    
+                            for b in range(val_input_ids.shape[0]):
+                                val_loss = online_diffusion_forward(
+                                    val_input_ids[b : b + 1],
+                                    val_labels[b : b + 1],
+                                    val_start_pos[b : b + 1] if val_start_pos.dim() > 0 else val_start_pos.unsqueeze(0),
+                                    val_steps,
+                                    mask_id,
+                                    pad_id,
+                                )
+                                total_val_loss += val_loss.item()
+                                num_val_batches += 1
                     avg_val_loss = total_val_loss / num_val_batches if num_val_batches > 0 else 0.0
-                    logger.info(f"Validation Loss at step {global_step}: {avg_val_loss:.4f}")
-                    
+                    gathered_val_loss = accelerator.gather(torch.tensor(avg_val_loss, device=accelerator.device)).mean().item()
+                    logger.info(f"Validation Loss at step {global_step}: {gathered_val_loss:.4f}")
                     if accelerator.is_main_process:
-                        accelerator.log({"val_loss": avg_val_loss}, step=global_step)
-                    
+                        accelerator.log({"val_loss": gathered_val_loss}, step=global_step)
                     model.train()
                 # -----------------------
 
@@ -851,11 +817,9 @@ def main():
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-                # Calculate aggregated metrics
                 batch_length_max = max(batch_length_list) if batch_length_list else 0
                 batch_length_avg = sum(batch_length_list) / len(batch_length_list) if batch_length_list else 0
-                mask_num_max = max(mask_num_list) if mask_num_list else 0
-                mask_num_avg = sum(mask_num_list) / len(mask_num_list) if mask_num_list else 0
+                step_count_avg = sum(step_count_list) / len(step_count_list) if step_count_list else 0
 
                 accelerator.log({
                     "train_loss": accumulated_loss,
@@ -864,13 +828,12 @@ def main():
                     "learning_rate": lr_scheduler.get_last_lr()[0],
                     "batch_length_max": batch_length_max,
                     "batch_length_avg": batch_length_avg,
-                    "mask_num_max": mask_num_max,
-                    "mask_num_avg": mask_num_avg
+                    "diffusion_steps_avg": step_count_avg,
                 }, step=global_step)
-                
+
                 accumulated_loss = 0.0
                 batch_length_list = []
-                mask_num_list = []
+                step_count_list = []
 
                 lr_scheduler.step()
                 global_step += 1
@@ -889,9 +852,9 @@ def main():
                     accelerator.wait_for_everyone()
                     logger.info("Finish wait_for_everyone")
                     ckpt_name = f"checkpoint-{global_step}"
-                    save_checkpoint(model, tokenizer, config, accelerator, ckpt_name, global_step=global_step, epoch=epoch, resumable=is_resumable)
+                    save_checkpoint(model, tokenizer, config, accelerator, ckpt_name, global_step=global_step, epoch=epoch, steps_setting_idx=steps_setting_idx, resumable=is_resumable)
 
-                del input_ids, labels, p_mask_lm
+                del input_ids, labels, start_pos
                 torch.cuda.empty_cache()
 
 
@@ -901,7 +864,7 @@ def main():
 
     # save checkpoint at the end of training
     ckpt_name = "final"
-    save_checkpoint(model, tokenizer, config, accelerator, ckpt_name, global_step=global_step, epoch=epoch, resumable=True)
+    save_checkpoint(model, tokenizer, config, accelerator, ckpt_name, global_step=global_step, epoch=epoch, steps_setting_idx=steps_setting_idx, resumable=True)
 
     accelerator.end_training()
 
@@ -910,10 +873,11 @@ def main():
 
 
 
-def save_checkpoint(model, tokenizer, config, accelerator, ckpt_name, global_step=None, epoch=None, resumable=True):
+def save_checkpoint(model, tokenizer, config, accelerator, ckpt_name, global_step=None, epoch=None, steps_setting_idx=None, resumable=True):
     """Save checkpoint in HuggingFace format. Optionally also save optimizer/scheduler/RNG for resume.
 
     Args:
+        steps_setting_idx: Online-specific round-robin index for TOTAL_STEPS_SETTING.
         resumable: If True, save full state (accelerator.save_state) for resuming. If False, save only
             model + tokenizer (lightweight, cannot resume from this checkpoint).
     """
@@ -961,6 +925,8 @@ def save_checkpoint(model, tokenizer, config, accelerator, ckpt_name, global_ste
             trainer_state["global_step"] = global_step
         if epoch is not None:
             trainer_state["epoch"] = epoch
+        if steps_setting_idx is not None:
+            trainer_state["steps_setting_idx"] = steps_setting_idx
         if trainer_state:
             with (save_base / "trainer_state.json").open("w", encoding="utf-8") as f:
                 json.dump(trainer_state, f, indent=2)

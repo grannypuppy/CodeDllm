@@ -144,6 +144,7 @@ def analyze_results(baseline_file, target_file, nrows2analyze, augmented_output=
             
             speedup = 0.0
             # Calculate speedup only if both are correct and valid runtimes exist
+            # 存储原始值到 augmented 文件；聚合统计时再取 max(1, speedup)
             if correct and base_correct and base_runtime > 0 and runtime > 0:
                 speedup = base_runtime / runtime
             
@@ -231,8 +232,10 @@ def analyze_results(baseline_file, target_file, nrows2analyze, augmented_output=
             valid_speedups = [s for s in correct_samples_speedups if s > 0]
             
             if valid_speedups:
-                best_s = max(valid_speedups)
-                avg_s = np.mean(valid_speedups)
+                # 聚合时对 speedup 取 max(1, x)，augmented 文件中仍存原始值
+                capped = [max(1.0, s) for s in valid_speedups]
+                best_s = max(capped)
+                avg_s = np.mean(capped)
                 
                 best_speedups.append(best_s)
                 avg_speedups.append(avg_s)
@@ -292,8 +295,13 @@ def analyze_results(baseline_file, target_file, nrows2analyze, augmented_output=
     pct_avg_gt_1_2 = calc_pct(count_avg_gt_1_2, total_rows)
     pct_avg_gt_1_5 = calc_pct(count_avg_gt_1_5, total_rows)
 
-    gmean_best = geometric_mean(best_speedups)
-    gmean_avg = geometric_mean(avg_speedups)
+    # Arithmetic mean: sum / count
+    def arithmetic_mean(data):
+        if not data:
+            return 0.0
+        return sum(data) / len(data)
+    amean_best = arithmetic_mean(best_speedups)
+    amean_avg = arithmetic_mean(avg_speedups)
     
     # 输出增广数据与不同 speedup 阈值的子集
     output_base = augmented_output or f"{target_file}.augmented.jsonl"
@@ -315,9 +323,9 @@ def analyze_results(baseline_file, target_file, nrows2analyze, augmented_output=
     print(f"  Best@{k}: {pass_best_rate:.2f}%")
     print(f"  Avg@{k}:  {pass_avg_rate:.2f}%")
     print("-" * 40)
-    print(f"GMean Speedup:")
-    print(f"  Best@{k}: {gmean_best:.4f}")
-    print(f"  Avg@{k}:  {gmean_avg:.4f}")
+    print(f"AMean Speedup (算术平均 = 和/总个数):")
+    print(f"  Best@{k}: {amean_best:.4f}")
+    print(f"  Avg@{k}:  {amean_avg:.4f}")
     print("-" * 40)
     print(f"Speedup > 1.1 (%):")
     print(f"  Best@{k}: {pct_best_gt_1_1:.2f}%")

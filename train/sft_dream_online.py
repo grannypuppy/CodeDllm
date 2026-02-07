@@ -59,6 +59,9 @@ DIFFUSION_THRESHOLD = None
 # Loss mode: True = grouped loss (normal + pad_group, same as sft_dream_chat 668-705); False = simple mean over response segment (same as chat else branch)
 USE_GROUPED_LOSS = True
 
+# True = 每个 diffusion step 后打印 Pos | Sampled | Updated | Confidence | Changed | Target（与 generation_utils 一致，并多一列 ground truth）
+DETAILED_STEP_LOG = False
+
 
 
 class TrainDataset(Dataset):
@@ -93,6 +96,15 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
+
+    # Validate checkpoint intervals: resumable_ckpt_interval must be a multiple of ckpt_interval
+    ckpt_interval = config.training.get("ckpt_interval")
+    resumable_ckpt_interval = config.training.get("resumable_ckpt_interval")
+    if resumable_ckpt_interval is not None and ckpt_interval is not None:
+        if resumable_ckpt_interval % ckpt_interval != 0:
+            raise ValueError(
+                f"resumable_ckpt_interval ({resumable_ckpt_interval}) must be a multiple of ckpt_interval ({ckpt_interval})"
+            )
 
     config.experiment.logging_dir = str( Path("projects") / Path(config.experiment.project) / Path(config.experiment.wandb_run_name) / "logs")
     accelerator = Accelerator(
@@ -136,6 +148,7 @@ def main():
         )
         wandb_config = {k: v for k, v in flatten_omega_conf(config, resolve=True)}
         wandb_config.pop("experiment.resume_from_checkpoint", None)
+        wandb_config.pop("training.resume_from_checkpoint", None)
 
         accelerator.init_trackers(
             config.experiment.project,
@@ -156,12 +169,19 @@ def main():
     #########################
     # MODELS and OPTIMIZER  #
     #########################
+    resume_from_checkpoint = config.experiment.get("resume_from_checkpoint", None) or config.training.get("resume_from_checkpoint", None)
+    if resume_from_checkpoint:
+        resume_from_checkpoint = Path(resume_from_checkpoint).resolve()
+        if not resume_from_checkpoint.is_dir():
+            raise FileNotFoundError(f"resume_from_checkpoint not found or not a directory: {resume_from_checkpoint}")
+        logger.info(f"Resuming from checkpoint: {resume_from_checkpoint}")
+        load_path = str(resume_from_checkpoint)
+    else:
+        load_path = pretrained_model
+
     logger.info("Loading models and optimizer")
-
-    tokenizer = DreamTokenizer.from_pretrained(pretrained_model)
-
-
-    model = DreamModel.from_pretrained(pretrained_model, torch_dtype=torch.bfloat16)
+    tokenizer = DreamTokenizer.from_pretrained(load_path)
+    model = DreamModel.from_pretrained(load_path, torch_dtype=torch.bfloat16)
 
     
 
@@ -388,8 +408,24 @@ def main():
         model, optimizer, lr_scheduler, train_dataloader_lm = accelerator.prepare(
             model, optimizer, lr_scheduler, train_dataloader_lm
         )
+    accelerator.register_for_checkpointing(lr_scheduler)
 
-    
+    # Load full training state when resuming (optimizer, scheduler, RNG; model/tokenizer already loaded from load_path)
+    first_epoch = 0
+    global_step = 0
+    steps_setting_idx = 0  # Online: round-robin index for TOTAL_STEPS_SETTING
+    if resume_from_checkpoint:
+        accelerator.load_state(str(resume_from_checkpoint))
+        trainer_state_path = Path(resume_from_checkpoint) / "trainer_state.json"
+        if trainer_state_path.is_file():
+            with open(trainer_state_path, "r", encoding="utf-8") as f:
+                trainer_state = json.load(f)
+            global_step = int(trainer_state.get("global_step", 0))
+            first_epoch = int(trainer_state.get("epoch", 0))
+            steps_setting_idx = int(trainer_state.get("steps_setting_idx", 0))
+            logger.info(f"Resumed training state: global_step={global_step}, epoch={first_epoch}, steps_setting_idx={steps_setting_idx}")
+        else:
+            logger.warning(f"No trainer_state.json in {resume_from_checkpoint}; starting from global_step=0, epoch=0")
 
     #################################
     #             Training          #
@@ -405,10 +441,9 @@ def main():
     logger.info(f"  Gradient Accumulation steps = {config.training.gradient_accumulation_steps}")
     logger.info(f"  Online: TOTAL_STEPS_SETTING = {TOTAL_STEPS_SETTING}, logic samples per step = {num_logic_samples_per_step}")
 
-    first_epoch = 0
-    global_step = 0
     data_time_m = AverageMeter()
     end = time.time()
+    epoch = first_epoch  # so final save has a defined epoch even if loop runs 0 times
 
     import torch.nn.functional as F
 
@@ -438,9 +473,10 @@ def main():
     @torch.no_grad()
     def diffusion_step_update(x, logits, i, steps, timesteps, mask_token_id, alg, alg_temp, temperature, top_p, top_k, threshold, device, state=None):
         """Update x for next diffusion step. Same logic as generation_utils._sample (while loop body). No grad.
-        For alg=='confidence_threshold', state is dict with number_transfer_tokens, left_tokens_last_step, steps (mutable); returns updated state."""
-        # Same as generation_utils: mask_index, shift logits, sample_tokens
-        mask_index = (x == mask_token_id)
+        Returns (state, x0_full, confidence_full, x_next). Must return a new tensor x_next instead of modifying x
+        in place, so that x (used in model(x) for this step) is not altered and backward() can compute gradients."""
+        x_next = x.clone()  # 不在原 x 上 inplace 修改，否则 backward 会报 "modified by an inplace operation"
+        mask_index = (x_next == mask_token_id)
         logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
         confidence_full, x0_full = sample_tokens(
             logits, temperature=temperature, top_p=top_p, top_k=top_k,
@@ -452,21 +488,21 @@ def main():
 
         if alg == 'origin':
             p_transfer = 1 - s / t if i < steps - 1 else 1
-            x0 = torch.zeros_like(x[mask_index], device=device, dtype=torch.long) + mask_token_id
+            x0 = torch.zeros_like(x_next[mask_index], device=device, dtype=torch.long) + mask_token_id
             transfer_index_t_s = torch.rand(*x0.shape, device=device) < p_transfer
             x0[transfer_index_t_s] = x0_full[mask_index][transfer_index_t_s]
-            x[mask_index] = x0.clone()
-            x[~mask_index] = x0_full[~mask_index]
+            x_next[mask_index] = x0.clone()
+            x_next[~mask_index] = x0_full[~mask_index]
         elif alg == 'confidence_threshold':
             number_transfer_tokens = state["number_transfer_tokens"]
             left_tokens_last_step = state["left_tokens_last_step"]
-            full_confidence = torch.full_like(x, -torch.inf, device=device, dtype=logits.dtype)
+            full_confidence = torch.full_like(x_next, -torch.inf, device=device, dtype=logits.dtype)
             full_confidence[mask_index] = confidence_full[mask_index]
             current_transfer_tokens = number_transfer_tokens + left_tokens_last_step
             state["left_tokens_last_step"] = 0
             selected_confidence, select_index = torch.topk(full_confidence, current_transfer_tokens)
-            transfer_index = torch.zeros_like(x, device=x.device, dtype=torch.bool)
-            select_index = select_index.to(x.device)
+            transfer_index = torch.zeros_like(x_next, device=x_next.device, dtype=torch.bool)
+            select_index = select_index.to(x_next.device)
             transfer_index[0, select_index[0]] = True
             for k in range(1, current_transfer_tokens):
                 if selected_confidence[0, k] < threshold:
@@ -478,16 +514,16 @@ def main():
                         state["steps"] = state.get("steps", steps) + 1
                         state["left_tokens_last_step"] += 1
                         transfer_index[0, select_index[0, k]] = False
-            x[~mask_index] = x0_full[~mask_index]
-            x[transfer_index] = x0_full[transfer_index]
+            x_next[~mask_index] = x0_full[~mask_index]
+            x_next[transfer_index] = x0_full[transfer_index]
         else:
             if alg not in ('maskgit_plus', 'topk_margin', 'entropy'):
                 raise RuntimeError(f"Unknown alg: {alg}")
             num_mask_token = mask_index.sum() / mask_index.shape[0]
             number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps - 1 else int(num_mask_token)
-            full_confidence = torch.full_like(x, -torch.inf, device=device, dtype=logits.dtype)
+            full_confidence = torch.full_like(x_next, -torch.inf, device=device, dtype=logits.dtype)
             full_confidence[mask_index] = confidence_full[mask_index]
-            x[~mask_index] = x0_full[~mask_index]
+            x_next[~mask_index] = x0_full[~mask_index]
             if number_transfer_tokens > 0:
                 if alg_temp is None or alg_temp == 0:
                     _, transfer_index = torch.topk(full_confidence, number_transfer_tokens)
@@ -495,9 +531,9 @@ def main():
                     full_confidence = full_confidence / alg_temp
                     full_confidence = F.softmax(full_confidence, dim=-1)
                     transfer_index = torch.multinomial(full_confidence, num_samples=number_transfer_tokens)
-                row_indices = torch.arange(x.size(0), device=device).unsqueeze(1).expand_as(transfer_index)
-                x[row_indices, transfer_index] = x0_full[row_indices, transfer_index]
-        return state
+                row_indices = torch.arange(x_next.size(0), device=device).unsqueeze(1).expand_as(transfer_index)
+                x_next[row_indices, transfer_index] = x0_full[row_indices, transfer_index]
+        return state, x0_full, confidence_full, x_next
 
     def online_diffusion_forward(input_ids, labels, start_pos, steps, mask_id, pad_id):
         """One diffusion run: align with inference loop; at each step compute loss on response vs GT.
@@ -570,12 +606,46 @@ def main():
             total_loss = total_loss + step_loss_sum / B
             num_steps += 1
 
-            state = diffusion_step_update(
+            state, x0_full, confidence_full, x = diffusion_step_update(
                 x, logits, i, current_steps, timesteps, mask_id, DIFFUSION_ALG, DIFFUSION_ALG_TEMP,
                 DIFFUSION_TEMPERATURE, DIFFUSION_TOP_P, DIFFUSION_TOP_K, DIFFUSION_THRESHOLD, device, state,
             )
             if state is not None and "steps" in state:
                 current_steps = state["steps"]
+            # 每步后详细 log（与 generation_utils 一致，多一列 Target；pad/eos 等均用 decode，不做特殊打印）；仅 main process 打印
+            if DETAILED_STEP_LOG and accelerator.is_main_process and tokenizer is not None and x0_full is not None and confidence_full is not None:
+                _mask_id = mask_id.item() if isinstance(mask_id, torch.Tensor) else mask_id
+
+                def _cell(s: str, w: int = 10) -> str:
+                    """单行、去换行、截断到 w 个字符，保证表格不对齐乱掉。"""
+                    s = (s or "?").replace("\n", " ").replace("\r", " ").strip()
+                    if len(s) > w:
+                        s = s[:w]
+                    return s.ljust(w)
+
+                for b_idx in range(min(1, B)):  # 只打第一个样本，避免刷屏
+                    start_pos_b = start_pos_1d[b_idx].item()
+                    seq_len = x.shape[1]
+                    W = 13
+                    print(f"\033[32m=== Diffusion Step {i} (after update) [sample {b_idx}] ===\033[0m")
+                    print(f"{'Pos':<6} | {'Sampled':<{W}} | {'Updated':<{W}} | {'Conf':<8} | {'Target':<{W}}")
+                    print("-" * (6 + 3 + W * 3 + 8 + 3 + W + 12))
+                    for pos in range(seq_len):
+                        sampled_id = x0_full[b_idx, pos].item()
+                        updated_id = x[b_idx, pos].item()
+                        conf = confidence_full[b_idx, pos].item()
+                        s_sampled = tokenizer.decode([sampled_id]) if sampled_id != _mask_id else "<|MASK|>"
+                        s_updated = tokenizer.decode([updated_id]) if updated_id != _mask_id else "<|MASK|>"
+                        # Target: 一律用 decode，不单独处理 pad_id/eos_id；仅 -100 与 prompt 段用占位
+                        label_id = labels[b_idx, pos].item()
+                        if pos < start_pos_b:
+                            s_target = "<prompt>"
+                        elif label_id == -100:
+                            s_target = "<ignore>"
+                        else:
+                            s_target = tokenizer.decode([label_id])
+                        print(f"{pos:<6} | {_cell(s_sampled, W)} | {_cell(s_updated, W)} | {conf:>7.4f} | {_cell(s_target, W)}")
+                    print("=" * (6 + 3 + W * 3 + 8 + 3 + W + 12))
             i += 1
         return total_loss / max(num_steps, 1)
 
@@ -589,13 +659,19 @@ def main():
 
     from tqdm.auto import tqdm
 
-    steps_setting_idx = 0
     for epoch in range(first_epoch, num_train_epochs):
-        
         model.train()
-        
+        # When resuming mid-epoch: skip batches already processed (Accelerate does not save DataLoader state)
+        active_dataloader = train_dataloader_lm
+        if resume_from_checkpoint and epoch == first_epoch and global_step > 0:
+            steps_done_in_prev_epochs = num_update_steps_per_epoch * first_epoch
+            steps_done_in_this_epoch = global_step - steps_done_in_prev_epochs
+            batches_to_skip = steps_done_in_this_epoch * accelerator.gradient_accumulation_steps
+            active_dataloader = accelerator.skip_first_batches(train_dataloader_lm, batches_to_skip)
+            logger.info(f"Skipping first {batches_to_skip} batches (step {steps_done_in_this_epoch} in epoch {epoch}) to resume from global_step={global_step}")
+
         progress_bar = tqdm(
-            train_dataloader_lm,
+            active_dataloader,
             desc=f"Epoch {epoch+1}/{num_train_epochs}",
             disable=not accelerator.is_local_main_process,
             dynamic_ncols=True, 
@@ -704,11 +780,20 @@ def main():
                 global_step += 1
                 
                 if config.training.ckpt_interval is not None and global_step % config.training.ckpt_interval == 0:
-                    logger.info(f"Saving checkpoint at global step {global_step} ...")
+                    resumable_interval = config.training.get("resumable_ckpt_interval")
+                    if resumable_interval is None:
+                        is_resumable = False
+                    else:
+                        if resumable_interval % config.training.ckpt_interval != 0:
+                            raise ValueError(
+                                f"resumable_ckpt_interval ({resumable_interval}) must be a multiple of ckpt_interval ({config.training.ckpt_interval})"
+                            )
+                        is_resumable = (global_step % resumable_interval == 0)
+                    logger.info(f"Saving checkpoint at global step {global_step} ({'resumable' if is_resumable else 'lightweight'}) ...")
                     accelerator.wait_for_everyone()
                     logger.info("Finish wait_for_everyone")
                     ckpt_name = f"checkpoint-{global_step}"
-                    save_checkpoint(model, tokenizer, config, accelerator, ckpt_name)
+                    save_checkpoint(model, tokenizer, config, accelerator, ckpt_name, global_step=global_step, epoch=epoch, steps_setting_idx=steps_setting_idx, resumable=is_resumable)
 
                 del input_ids, labels, start_pos
                 torch.cuda.empty_cache()
@@ -720,7 +805,7 @@ def main():
 
     # save checkpoint at the end of training
     ckpt_name = "final"
-    save_checkpoint(model, tokenizer, config, accelerator, ckpt_name)
+    save_checkpoint(model, tokenizer, config, accelerator, ckpt_name, global_step=global_step, epoch=epoch, steps_setting_idx=steps_setting_idx, resumable=True)
 
     accelerator.end_training()
 
@@ -729,16 +814,22 @@ def main():
 
 
 
-def save_checkpoint(model, tokenizer, config, accelerator, ckpt_name):
+def save_checkpoint(model, tokenizer, config, accelerator, ckpt_name, global_step=None, epoch=None, steps_setting_idx=None, resumable=True):
+    """Save checkpoint in HuggingFace format. Optionally also save optimizer/scheduler/RNG for resume.
+
+    Args:
+        steps_setting_idx: Online-specific round-robin index for TOTAL_STEPS_SETTING.
+        resumable: If True, save full state (accelerator.save_state) for resuming. If False, save only
+            model + tokenizer (lightweight, cannot resume from this checkpoint).
+    """
     output_dir = Path("projects", config.experiment.project, config.experiment.wandb_run_name)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    checkpoints_total_limit = config.experiment.get("checkpoints_total_limit", None)
+    checkpoints_total_limit = config.training.get("checkpoints_total_limit", None)
 
     if accelerator.is_main_process and checkpoints_total_limit is not None:
         ckpts = sorted(
-            [d for d in output_dir.iterdir() if d.name.startswith("checkpoint")],
-            key=lambda p: int(p.name.split("-")[1]),
+            [d for d in output_dir.iterdir() if d.is_dir() and d.name.startswith("checkpoint")],
+            key=lambda p: int(p.name.split("-")[1]) if "-" in p.name else 0,
         )
         if len(ckpts) >= checkpoints_total_limit:
             to_remove = ckpts[: len(ckpts) - checkpoints_total_limit + 1]
@@ -747,7 +838,7 @@ def save_checkpoint(model, tokenizer, config, accelerator, ckpt_name):
                 shutil.rmtree(p, ignore_errors=True)
 
     save_base = output_dir / ckpt_name
-
+    save_base.mkdir(parents=True, exist_ok=True)
     model_to_save = accelerator.unwrap_model(model)
     state_dict = accelerator.get_state_dict(model)
 
@@ -763,10 +854,30 @@ def save_checkpoint(model, tokenizer, config, accelerator, ckpt_name):
         metadata = {
             "save_time": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        with (save_base / "metadata.json").open("w") as f:
+        if global_step is not None:
+            metadata["global_step"] = global_step
+        if epoch is not None:
+            metadata["epoch"] = epoch
+        with (save_base / "metadata.json").open("w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
 
-        logger.info(f"Saved model + tokenizer to {save_base}")
+        trainer_state = {}
+        if global_step is not None:
+            trainer_state["global_step"] = global_step
+        if epoch is not None:
+            trainer_state["epoch"] = epoch
+        if steps_setting_idx is not None:
+            trainer_state["steps_setting_idx"] = steps_setting_idx
+        if trainer_state:
+            with (save_base / "trainer_state.json").open("w", encoding="utf-8") as f:
+                json.dump(trainer_state, f, indent=2)
+
+        logger.info(f"Saved model + tokenizer to {save_base}" + (" (resumable)" if resumable else " (lightweight)"))
+
+    # Save optimizer, scheduler, RNG with Accelerator when resumable; all processes must call for DeepSpeed
+    accelerator.wait_for_everyone()
+    if resumable:
+        accelerator.save_state(str(save_base))
     
 
 

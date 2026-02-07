@@ -8,8 +8,9 @@ import fire
 import types
 
 try:
-    from models import DreamModel, DreamTokenizer
-    from models.dream.generation_utils_block import DreamGenerationMixin as BlockDreamGenerationMixin
+    from models.dream_online import DreamModel, DreamTokenizer
+    from models.dream_online.generation_utils_ast import DreamGenerationMixin
+    from models.dream_online.generation_utils_block_ast import DreamGenerationMixin as BlockDreamGenerationMixin
 except ImportError as e:
     logger.warning(f"Could not import Dream model components: {e}. Ensure you are in the correct environment and 'model' package is available.")
     DreamModel = None
@@ -64,9 +65,11 @@ class BenchmarkGenerator:
         if use_cache:
             self.model.diffusion_generate = types.MethodType(BlockDreamGenerationMixin.diffusion_generate, self.model)
             self.model._sample = types.MethodType(BlockDreamGenerationMixin._sample, self.model)
-            logger.info("Using block generation cache")
+            logger.info("Using block+AST generation cache")
         else:
             logger.info("Using full generation")
+            self.model.diffusion_generate = types.MethodType(DreamGenerationMixin.diffusion_generate, self.model)
+            self.model._sample = types.MethodType(DreamGenerationMixin._sample, self.model)
     def generate(self,
                  num_generations: int = 1,
                  max_new_tokens: int = 2048,
@@ -79,7 +82,8 @@ class BenchmarkGenerator:
                  top_p: float = 0.95,
                  alg_temp: float = 0.1,
                  top_k: int = None,
-                 alg: str = "entropy"):
+                 alg: str = "entropy",
+                 detailed_log: bool = False):
         
         def generation_tokens_hook_func(step, x, logits):
             print(f"\033[32m############ Step {step} After Remasking ############\033[0m")
@@ -159,6 +163,7 @@ class BenchmarkGenerator:
                     "block_length": block_size if use_cache else None,
                     "threshold": threshold,
                     "tokenizer": self.tokenizer,
+                    "detailed_log": detailed_log,
                     # "generation_tokens_hook_func": generation_tokens_hook_func
                 }
                 if threshold is not None:
@@ -217,15 +222,16 @@ def main(
     dual_cache: bool = False,
     block_size: int = 32,
     threshold: float = None,
-    top_p: float = 0.9,
+    top_p: float = 0.95,
     alg_temp: float = 0.1,
     temperature: float = 0.1,
     top_k: int = None,
     alg: str = "entropy",
     use_rsp_prefix: bool = None,
+    detailed_log: bool = False,
 ):
     """
-    Generate solutions for Python benchmarks using Dream model.
+    Generate solutions for Python benchmarks using Dream model (online AST diffusion).
     
     Args:
         model_path: Path to the Dream model.
@@ -242,8 +248,9 @@ def main(
         alg_temp: Algorithm temperature for diffusion sampling.
         temperature: Sampling temperature.
         top_k: Top-k sampling.
-        alg: Generation algorithm.
+        alg: Generation algorithm (origin / confidence_threshold / entropy / topk_margin / maskgit_plus).
         use_rsp_prefix: Use "Here is the optimized code:\n```python\n" prefix. Default uses USE_RSP_PREFIX.
+        detailed_log: If True, print per-step Pos/Sampled/Updated/Confidence table (requires tokenizer).
     """
     generator = BenchmarkGenerator(
         model_path=model_path,
@@ -263,7 +270,8 @@ def main(
         alg_temp=alg_temp,
         temperature=temperature,
         top_k=top_k,
-        alg=alg
+        alg=alg,
+        detailed_log=detailed_log
     )
 
 if __name__ == "__main__":

@@ -163,7 +163,7 @@ def _apply_ast_weighted_remasking(
                 continue
             depths_array = np.array(raw_char_weights, dtype=float)
             max_depth = np.max(depths_array)
-            inverted_depths = (1 + max_depth - depths_array) / (1 + max_depth)
+            inverted_depths = 1 + max_depth - depths_array
             inverted_depths = inverted_depths / inverted_depths.mean()
 
             full_text_reconstructed = ""
@@ -346,7 +346,6 @@ class DreamGenerationMixin:
         self,
         inputs: Optional[torch.Tensor] = None,
         generation_config: Optional[DreamGenerationConfig] = None,
-        tokenizer=None,
         **kwargs,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         generation_config = self._prepare_generation_config(generation_config, **kwargs)
@@ -387,6 +386,7 @@ class DreamGenerationMixin:
         dual_cache = kwargs.get("dual_cache", False)
         generation_tokens_hook_func = kwargs.pop("generation_tokens_hook_func", lambda step, x, logits: x)
         generation_logits_hook_func = kwargs.pop("generation_logits_hook_func", lambda step, x, logits: logits)
+        tokenizer = kwargs.pop("tokenizer", None)
 
         result = self._sample(
             input_ids,

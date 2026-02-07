@@ -9,7 +9,8 @@ import types
 
 try:
     from models import DreamModel, DreamTokenizer
-    from models.dream.generation_utils_block import DreamGenerationMixin as BlockDreamGenerationMixin
+    from models.dream.generation_utils_ast import DreamGenerationMixin
+    from models.dream.generation_utils_block_ast import DreamGenerationMixin as BlockDreamGenerationMixin
 except ImportError as e:
     logger.warning(f"Could not import Dream model components: {e}. Ensure you are in the correct environment and 'model' package is available.")
     DreamModel = None
@@ -64,9 +65,11 @@ class BenchmarkGenerator:
         if use_cache:
             self.model.diffusion_generate = types.MethodType(BlockDreamGenerationMixin.diffusion_generate, self.model)
             self.model._sample = types.MethodType(BlockDreamGenerationMixin._sample, self.model)
-            logger.info("Using block generation cache")
+            logger.info("Using block+AST generation cache")
         else:
             logger.info("Using full generation")
+            self.model.diffusion_generate = types.MethodType(DreamGenerationMixin.diffusion_generate, self.model)
+            self.model._sample = types.MethodType(DreamGenerationMixin._sample, self.model)
     def generate(self,
                  num_generations: int = 1,
                  max_new_tokens: int = 2048,
@@ -217,7 +220,7 @@ def main(
     dual_cache: bool = False,
     block_size: int = 32,
     threshold: float = None,
-    top_p: float = 0.9,
+    top_p: float = 0.95,
     alg_temp: float = 0.1,
     temperature: float = 0.1,
     top_k: int = None,

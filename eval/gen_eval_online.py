@@ -8,8 +8,8 @@ import fire
 import types
 
 try:
-    from models import DreamModel, DreamTokenizer
-    from models.dream.generation_utils_block import DreamGenerationMixin as BlockDreamGenerationMixin
+    from models.dream_online import DreamModel, DreamTokenizer
+    from models.dream_online.generation_utils_block import DreamGenerationMixin as BlockDreamGenerationMixin
 except ImportError as e:
     logger.warning(f"Could not import Dream model components: {e}. Ensure you are in the correct environment and 'model' package is available.")
     DreamModel = None
@@ -79,7 +79,8 @@ class BenchmarkGenerator:
                  top_p: float = 0.95,
                  alg_temp: float = 0.1,
                  top_k: int = None,
-                 alg: str = "entropy"):
+                 alg: str = "entropy",
+                 detailed_log: bool = False):
         
         def generation_tokens_hook_func(step, x, logits):
             print(f"\033[32m############ Step {step} After Remasking ############\033[0m")
@@ -159,6 +160,7 @@ class BenchmarkGenerator:
                     "block_length": block_size if use_cache else None,
                     "threshold": threshold,
                     "tokenizer": self.tokenizer,
+                    "detailed_log": detailed_log,
                     # "generation_tokens_hook_func": generation_tokens_hook_func
                 }
                 if threshold is not None:
@@ -223,6 +225,7 @@ def main(
     top_k: int = None,
     alg: str = "entropy",
     use_rsp_prefix: bool = None,
+    detailed_log: bool = False,
 ):
     """
     Generate solutions for Python benchmarks using Dream model.
@@ -244,6 +247,7 @@ def main(
         top_k: Top-k sampling.
         alg: Generation algorithm.
         use_rsp_prefix: Use "Here is the optimized code:\n```python\n" prefix. Default uses USE_RSP_PREFIX.
+        detailed_log: If True, log each diffusion step with Pos / Sampled / Updated / Confidence (like sft_dream_chat).
     """
     generator = BenchmarkGenerator(
         model_path=model_path,
@@ -263,7 +267,8 @@ def main(
         alg_temp=alg_temp,
         temperature=temperature,
         top_k=top_k,
-        alg=alg
+        alg=alg,
+        detailed_log=detailed_log,
     )
 
 if __name__ == "__main__":

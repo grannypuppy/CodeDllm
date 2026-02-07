@@ -125,6 +125,15 @@ def main():
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
 
+    # Validate checkpoint intervals: resumable_ckpt_interval must be a multiple of ckpt_interval
+    ckpt_interval = config.training.get("ckpt_interval")
+    resumable_ckpt_interval = config.training.get("resumable_ckpt_interval")
+    if resumable_ckpt_interval is not None and ckpt_interval is not None:
+        if resumable_ckpt_interval % ckpt_interval != 0:
+            raise ValueError(
+                f"resumable_ckpt_interval ({resumable_ckpt_interval}) must be a multiple of ckpt_interval ({ckpt_interval})"
+            )
+
     config.experiment.logging_dir = str( Path("projects") / Path(config.experiment.project) / Path(config.experiment.wandb_run_name) / "logs")
     accelerator = Accelerator(
         gradient_accumulation_steps=config.training.gradient_accumulation_steps,
@@ -182,9 +191,19 @@ def main():
     #########################
     # MODELS and OPTIMIZER  #
     #########################
+    resume_from_checkpoint = config.experiment.get("resume_from_checkpoint", None) or config.training.get("resume_from_checkpoint", None)
+    if resume_from_checkpoint:
+        resume_from_checkpoint = Path(resume_from_checkpoint).resolve()
+        if not resume_from_checkpoint.is_dir():
+            raise FileNotFoundError(f"resume_from_checkpoint not found or not a directory: {resume_from_checkpoint}")
+        logger.info(f"Resuming from checkpoint: {resume_from_checkpoint}")
+        load_path = str(resume_from_checkpoint)
+    else:
+        load_path = pretrained_model
+
     logger.info("Loading models and optimizer")
-    tokenizer = DreamTokenizer.from_pretrained(pretrained_model)
-    model = DreamModel.from_pretrained(pretrained_model, torch_dtype=torch.bfloat16)
+    tokenizer = DreamTokenizer.from_pretrained(load_path)
+    model = DreamModel.from_pretrained(load_path, torch_dtype=torch.bfloat16)
 
     if config.training.gradient_checkpointing_enable:
         model.gradient_checkpointing_enable()
@@ -264,6 +283,22 @@ def main():
         model, optimizer, lr_scheduler, train_dataloader_lm = accelerator.prepare(
             model, optimizer, lr_scheduler, train_dataloader_lm
         )
+    accelerator.register_for_checkpointing(lr_scheduler)
+
+    # Load full training state when resuming (optimizer, scheduler, RNG; model/tokenizer already loaded from load_path)
+    first_epoch = 0
+    global_step = 0
+    if resume_from_checkpoint:
+        accelerator.load_state(str(resume_from_checkpoint))
+        trainer_state_path = Path(resume_from_checkpoint) / "trainer_state.json"
+        if trainer_state_path.is_file():
+            with open(trainer_state_path, "r", encoding="utf-8") as f:
+                trainer_state = json.load(f)
+            global_step = int(trainer_state.get("global_step", 0))
+            first_epoch = int(trainer_state.get("epoch", 0))
+            logger.info(f"Resumed training state: global_step={global_step}, epoch={first_epoch}")
+        else:
+            logger.warning(f"No trainer_state.json in {resume_from_checkpoint}; starting from global_step=0, epoch=0")
 
     # ---------- Attention mask / forward_process：与 sft_dream_chat 完全一致 ----------
     def make_causal_attention_mask(input_ids):
@@ -410,17 +445,25 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size_lm}")
     logger.info(f"  Gradient Accumulation steps = {config.training.gradient_accumulation_steps}")
 
-    first_epoch = 0
-    global_step = 0
     data_time_m = AverageMeter()
     end = time.time()
+    epoch = first_epoch  # so final save has a defined epoch even if loop runs 0 times
 
     from tqdm.auto import tqdm
 
     for epoch in range(first_epoch, num_train_epochs):
         model.train()
+        # When resuming mid-epoch: skip batches already processed (Accelerate does not save DataLoader state)
+        active_dataloader = train_dataloader_lm
+        if resume_from_checkpoint and epoch == first_epoch and global_step > 0:
+            steps_done_in_prev_epochs = num_update_steps_per_epoch * first_epoch
+            steps_done_in_this_epoch = global_step - steps_done_in_prev_epochs
+            batches_to_skip = steps_done_in_this_epoch * accelerator.gradient_accumulation_steps
+            active_dataloader = accelerator.skip_first_batches(train_dataloader_lm, batches_to_skip)
+            logger.info(f"Skipping first {batches_to_skip} batches (step {steps_done_in_this_epoch} in epoch {epoch}) to resume from global_step={global_step}")
+
         progress_bar = tqdm(
-            train_dataloader_lm,
+            active_dataloader,
             desc=f"Epoch {epoch+1}/{num_train_epochs}",
             disable=not accelerator.is_local_main_process,
             dynamic_ncols=True,
@@ -529,11 +572,20 @@ def main():
                 global_step += 1
 
                 if config.training.ckpt_interval is not None and global_step % config.training.ckpt_interval == 0:
-                    logger.info(f"Saving checkpoint at global step {global_step} ...")
+                    resumable_interval = config.training.get("resumable_ckpt_interval")
+                    if resumable_interval is None:
+                        is_resumable = False
+                    else:
+                        if resumable_interval % config.training.ckpt_interval != 0:
+                            raise ValueError(
+                                f"resumable_ckpt_interval ({resumable_interval}) must be a multiple of ckpt_interval ({config.training.ckpt_interval})"
+                            )
+                        is_resumable = (global_step % resumable_interval == 0)
+                    logger.info(f"Saving checkpoint at global step {global_step} ({'resumable' if is_resumable else 'lightweight'}) ...")
                     accelerator.wait_for_everyone()
                     logger.info("Finish wait_for_everyone")
                     ckpt_name = f"checkpoint-{global_step}"
-                    save_checkpoint(model, tokenizer, config, accelerator, ckpt_name)
+                    save_checkpoint(model, tokenizer, config, accelerator, ckpt_name, global_step=global_step, epoch=epoch, resumable=is_resumable)
 
                 del input_ids, labels, p_mask_lm
                 torch.cuda.empty_cache()
@@ -543,20 +595,26 @@ def main():
 
     # save checkpoint at the end of training
     ckpt_name = "final"
-    save_checkpoint(model, tokenizer, config, accelerator, ckpt_name)
+    save_checkpoint(model, tokenizer, config, accelerator, ckpt_name, global_step=global_step, epoch=epoch, resumable=True)
 
     accelerator.end_training()
 
 
-def save_checkpoint(model, tokenizer, config, accelerator, ckpt_name):
+def save_checkpoint(model, tokenizer, config, accelerator, ckpt_name, global_step=None, epoch=None, resumable=True):
+    """Save checkpoint in HuggingFace format. Optionally also save optimizer/scheduler/RNG for resume.
+
+    Args:
+        resumable: If True, save full state (accelerator.save_state) for resuming. If False, save only
+            model + tokenizer (lightweight, cannot resume from this checkpoint).
+    """
     output_dir = Path("projects", config.experiment.project, config.experiment.wandb_run_name)
     output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoints_total_limit = config.experiment.get("checkpoints_total_limit", None)
+    checkpoints_total_limit = config.training.get("checkpoints_total_limit", None)
 
     if accelerator.is_main_process and checkpoints_total_limit is not None:
         ckpts = sorted(
-            [d for d in output_dir.iterdir() if d.name.startswith("checkpoint")],
-            key=lambda p: int(p.name.split("-")[1]),
+            [d for d in output_dir.iterdir() if d.is_dir() and d.name.startswith("checkpoint")],
+            key=lambda p: int(p.name.split("-")[1]) if "-" in p.name else 0,
         )
         if len(ckpts) >= checkpoints_total_limit:
             to_remove = ckpts[: len(ckpts) - checkpoints_total_limit + 1]
@@ -565,6 +623,7 @@ def save_checkpoint(model, tokenizer, config, accelerator, ckpt_name):
                 shutil.rmtree(p, ignore_errors=True)
 
     save_base = output_dir / ckpt_name
+    save_base.mkdir(parents=True, exist_ok=True)
     model_to_save = accelerator.unwrap_model(model)
     state_dict = accelerator.get_state_dict(model)
 
@@ -580,10 +639,28 @@ def save_checkpoint(model, tokenizer, config, accelerator, ckpt_name):
         metadata = {
             "save_time": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        with (save_base / "metadata.json").open("w") as f:
+        if global_step is not None:
+            metadata["global_step"] = global_step
+        if epoch is not None:
+            metadata["epoch"] = epoch
+        with (save_base / "metadata.json").open("w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
 
-        logger.info(f"Saved model + tokenizer to {save_base}")
+        trainer_state = {}
+        if global_step is not None:
+            trainer_state["global_step"] = global_step
+        if epoch is not None:
+            trainer_state["epoch"] = epoch
+        if trainer_state:
+            with (save_base / "trainer_state.json").open("w", encoding="utf-8") as f:
+                json.dump(trainer_state, f, indent=2)
+
+        logger.info(f"Saved model + tokenizer to {save_base}" + (" (resumable)" if resumable else " (lightweight)"))
+
+    # Save optimizer, scheduler, RNG with Accelerator when resumable; all processes must call for DeepSpeed
+    accelerator.wait_for_everyone()
+    if resumable:
+        accelerator.save_state(str(save_base))
 
 
 if __name__ == "__main__":
