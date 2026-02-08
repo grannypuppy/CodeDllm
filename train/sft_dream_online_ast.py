@@ -638,8 +638,8 @@ def main():
                     non_pad_indices = torch.where(is_non_pad, indices_b, torch.tensor(-1, device=device))
                     last_non_pad_idx = non_pad_indices.max().item()
                     cutoff_idx = last_non_pad_idx + 1
-                    is_normal_mask = indices_b <= last_non_pad_idx
-                    is_pad_group_mask = indices_b > last_non_pad_idx
+                    is_normal_mask = indices_b <= cutoff_idx
+                    is_pad_group_mask = indices_b > cutoff_idx
                     final_normal_mask = is_normal_mask
                     final_pad_group_mask = is_pad_group_mask
                     loss_normal_sum = (token_losses_b * final_normal_mask.float()).sum()
