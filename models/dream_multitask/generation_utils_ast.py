@@ -19,9 +19,13 @@
 import time
 import warnings
 import copy
+import sys
+import os
+import numpy as np
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
-
+from loguru import logger
+import re
 import torch
 import torch.distributions as dists
 from torch.nn import functional as F
@@ -32,11 +36,10 @@ from transformers.generation.configuration_utils import (
 from transformers.utils import (
     ModelOutput,
     is_torchdynamo_compiling,
-    logging,
 )
 
-logger = logging.get_logger(__name__)
-
+# Add parent directory to path to import local modules
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def top_p_logits(logits, top_p=None):
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
@@ -92,6 +95,29 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
         confidence = torch.sum(probs * log_probs, dim=-1)
     
     return confidence, x0
+
+
+def scores_to_eps_ranks(scores: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+    """
+    Convert per-position scores to rank ids (ascending).
+    Positions whose absolute score difference is <= eps are assigned the same rank.
+    """
+    if scores.ndim != 2:
+        raise ValueError(f"`scores` must have shape (B, T), got {tuple(scores.shape)}")
+
+    ranks = torch.zeros_like(scores, dtype=scores.dtype)
+    for b in range(scores.size(0)):
+        row = scores[b]
+        sorted_vals, sorted_idx = torch.sort(row)
+        sorted_ranks = torch.zeros_like(sorted_vals, dtype=scores.dtype)
+        current_rank = torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
+        sorted_ranks[0] = current_rank
+        for k in range(1, sorted_vals.size(0)):
+            if torch.abs(sorted_vals[k] - sorted_vals[k - 1]) > eps:
+                current_rank = current_rank + 1.0
+            sorted_ranks[k] = current_rank
+        ranks[b, sorted_idx] = sorted_ranks
+    return ranks
 
 
 @dataclass
@@ -355,6 +381,8 @@ class DreamGenerationMixin:
             attention_mask=attention_mask 
         )
         threshold = kwargs.get("threshold", 0.9)
+        tokenizer = kwargs.pop("tokenizer", None)
+        rank_eps = kwargs.pop("rank_eps", 1e-4)
 
         result = self._sample(
             input_ids,
@@ -362,7 +390,9 @@ class DreamGenerationMixin:
             generation_config=generation_config,
             generation_tokens_hook_func=generation_tokens_hook_func,
             generation_logits_hook_func=generation_logits_hook_func,
-            threshold=threshold
+            threshold=threshold,
+            tokenizer=tokenizer,
+            rank_eps=rank_eps,
         )
         return result
 
@@ -373,7 +403,9 @@ class DreamGenerationMixin:
         generation_config: DreamGenerationConfig,
         generation_tokens_hook_func,
         generation_logits_hook_func,
-        threshold: Optional[float] = 0.9
+        threshold: Optional[float] = 0.9,
+        tokenizer = None,
+        rank_eps: float = 1e-4,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
         output_history = generation_config.output_history
@@ -421,9 +453,20 @@ class DreamGenerationMixin:
             number_transfer_tokens = mask_index.sum().item() // steps
             left_tokens_last_step = 0
         while i < steps:
+            # logger.info(f"step: {i}")
             mask_index = (x == mask_token_id)
-            logits = self(x, attention_mask, tok_idx).logits
+            outputs = self(x, attention_mask, tok_idx)
+            logits = outputs.logits
+            rank_values = outputs.rank_values
+            
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+            rank_values = torch.cat([rank_values[:,:1], rank_values[:, :-1]], dim=1) # (B, T, 1)
+            rank_values = rank_values.squeeze(-1) # (B, T)
+
+            # Design: pred = softmax(rank_head(hidden_states))
+            rank_pred = F.softmax(rank_values, dim=-1)
+            # Convert pred to eps-aware rank ids, then use rank ids as depth proxy for weighting.
+            rank_ids = scores_to_eps_ranks(rank_pred, eps=rank_eps)
 
             # this allows user-defined logits control of the intermediate steps
             logits = generation_logits_hook_func(i, x, logits)
@@ -441,6 +484,27 @@ class DreamGenerationMixin:
                 x[mask_index] = x0.clone()
             elif alg == 'confidence_threshold':
                 confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
+
+                # Rank-aware confidence weighting:
+                # rank_ids are derived from pred=softmax(rank_head(hidden_states)).
+                mask_ranks = rank_ids[mask_index]
+                if mask_ranks.numel() > 0:
+                    max_rank = mask_ranks.max()
+                    # Smaller rank id (shallower) gets larger weight.
+                    inverted_weights = (1.0 + max_rank - mask_ranks) / (1.0 + max_rank)
+
+                    mean_weight = inverted_weights.mean()
+                    if mean_weight > 1e-6:
+                        normalized_weights = inverted_weights / mean_weight
+                    else:
+                        raise RuntimeError("Mean rank weight is too small, can't normalize.")
+
+                    mean_conf = confidence.mean()
+                    new_conf_subset = mean_conf + normalized_weights * (confidence - mean_conf)
+                    confidence = new_conf_subset
+
+                # --- Weighted Remasking Logic End ---
+
                 x_ = torch.zeros_like(x, device=self.device, dtype=torch.long) + mask_token_id
                 x_[mask_index] = x0.clone()
                 full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
@@ -473,6 +537,24 @@ class DreamGenerationMixin:
                     confidence, x0 = sample_tokens(mask_logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True)
                 else:
                     raise RuntimeError(f"Unknown alg: {alg}")
+
+                # --- Weighted Remasking Logic with Rank Prediction ---
+                mask_ranks = rank_ids[mask_index]
+                if mask_ranks.numel() > 0:
+                    max_rank = mask_ranks.max()
+                    inverted_weights = (1.0 + max_rank - mask_ranks) / (1.0 + max_rank)
+
+                    mean_weight = inverted_weights.mean()
+                    if mean_weight > 1e-6:
+                        normalized_weights = inverted_weights / mean_weight
+                    else:
+                        raise RuntimeError("Mean rank weight is too small, can't normalize.")
+
+                    mean_conf = confidence.mean()
+                    confidence = mean_conf + normalized_weights * (confidence - mean_conf)
+
+                # --- Weighted Remasking Logic End ---
+
                 num_mask_token = mask_index.sum() / mask_index.shape[0]
                 number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps - 1 else int(num_mask_token)
                 full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
@@ -483,7 +565,9 @@ class DreamGenerationMixin:
                     else:
                         full_confidence = full_confidence / alg_temp
                         full_confidence = F.softmax(full_confidence, dim=-1)
+                        # logger.info(f"full_confidence: {full_confidence}")
                         transfer_index = torch.multinomial(full_confidence, num_samples=number_transfer_tokens)
+                        # logger.info(f"transfer_index: {transfer_index}")
                     x_ = torch.zeros_like(x, device=self.device, dtype=torch.long) + mask_token_id
                     x_[mask_index] = x0.clone()
                     row_indices = torch.arange(x.size(0), device=self.device).unsqueeze(1).expand_as(transfer_index)
@@ -502,7 +586,7 @@ class DreamGenerationMixin:
 
         # final hook call after diffusion sampling completes
         x = generation_tokens_hook_func(-1, x, None)
-        
+
         if return_dict_in_generate:
             return DreamModelOutput(
                 sequences=x,

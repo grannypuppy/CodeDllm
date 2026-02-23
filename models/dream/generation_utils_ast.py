@@ -715,9 +715,9 @@ class DreamGenerationMixin:
                 histories.append(x.clone())
             i += 1
         
-        print(f'used steps: {steps}')
+        # print(f'used steps: {steps}')
         end_time = time.time()
-        print(f'used time: {end_time - start_time}')
+        # print(f'used time: {end_time - start_time}')
 
         # final hook call after diffusion sampling completes
         x = generation_tokens_hook_func(-1, x, None)

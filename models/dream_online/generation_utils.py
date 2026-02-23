@@ -415,6 +415,7 @@ class DreamGenerationMixin:
             attention_mask = "full"
 
         timesteps = torch.linspace(1, eps, steps + 1, device=x.device)
+        prompt_len = input_ids.shape[1]
 
         # this allows user-defined token control of the intermediate steps
         x = generation_tokens_hook_func(None, x, None)
@@ -428,6 +429,11 @@ class DreamGenerationMixin:
             left_tokens_last_step = 0
         while i < steps:
             mask_index = (x == mask_token_id)
+            # Only update non-mask positions inside generation region (do not overwrite prompt)
+            B, L = x.shape
+            in_gen_region = torch.arange(L, device=x.device).unsqueeze(0) >= prompt_len
+            update_non_mask = ~mask_index & in_gen_region
+
             logits = self(x, attention_mask, tok_idx).logits
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
 
@@ -450,7 +456,7 @@ class DreamGenerationMixin:
                 transfer_index_t_s = torch.rand(*x0.shape, device=self.device) < p_transfer
                 x0[transfer_index_t_s] = x0_full[mask_index][transfer_index_t_s]
                 x[mask_index] = x0.clone()
-                x[~mask_index] = x0_full[~mask_index]
+                x[update_non_mask] = x0_full[update_non_mask]
             elif alg == 'confidence_threshold':
                 full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
                 full_confidence[mask_index] = confidence_full[mask_index]
@@ -471,7 +477,7 @@ class DreamGenerationMixin:
                             left_tokens_last_step += 1
                             transfer_index[0, select_index[0, k]] = False
 
-                x[~mask_index] = x0_full[~mask_index]
+                x[update_non_mask] = x0_full[update_non_mask]
                 x[transfer_index] = x0_full[transfer_index]
 
             else:
@@ -481,7 +487,7 @@ class DreamGenerationMixin:
                 number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps - 1 else int(num_mask_token)
                 full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
                 full_confidence[mask_index] = confidence_full[mask_index]
-                x[~mask_index] = x0_full[~mask_index]
+                x[update_non_mask] = x0_full[update_non_mask]
                 if number_transfer_tokens > 0:
                     if alg_temp is None or alg_temp == 0:
                         _, transfer_index = torch.topk(full_confidence, number_transfer_tokens)

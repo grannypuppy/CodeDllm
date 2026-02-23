@@ -57,7 +57,10 @@ DIFFUSION_TOP_K = None
 DIFFUSION_THRESHOLD = None
 
 # Loss mode: True = grouped loss (normal + pad_group, same as sft_dream_chat 668-705); False = simple mean over response segment (same as chat else branch)
-USE_GROUPED_LOSS = False
+USE_GROUPED_LOSS = True
+
+# Step-weighted loss: True = weight each step's loss by (current_steps - i), earlier step higher weight; False = uniform weight per step
+USE_STEP_WEIGHTED_LOSS = True
 
 # True = 每个 diffusion step 后打印 Pos | Sampled | Updated | Confidence | Changed | Target（与 generation_utils 一致，并多一列 ground truth）
 DETAILED_STEP_LOG = False
@@ -332,7 +335,7 @@ def main():
     
     with open("./data/" + config.dataset.optimization_data, 'r') as f:
         dataset_load = json.load(f)
-    dataset_load = dataset_load[:1000]
+    dataset_load = dataset_load[:8]
 
     input_list = [x["input"] for x in dataset_load]
     target_list = [x["target"] for x in dataset_load]
@@ -567,6 +570,7 @@ def main():
 
         total_loss = 0.0
         num_steps = 0
+        total_weight = 0.0  # sum of step weights when USE_STEP_WEIGHTED_LOSS
         i = 0
         current_steps = steps
         while i < current_steps:
@@ -612,8 +616,14 @@ def main():
                     mask_num = token_losses_b.numel()
                     loss_per_seq_b = token_losses_b.sum() / max(mask_num, 1)
                 step_loss_sum = step_loss_sum + loss_per_seq_b
-            total_loss = total_loss + step_loss_sum / B
-            num_steps += 1
+            step_loss = step_loss_sum / B
+            if USE_STEP_WEIGHTED_LOSS:
+                step_weight = max(1, current_steps - i)  # earlier step -> higher weight
+                total_loss = total_loss + step_weight * step_loss
+                total_weight = total_weight + step_weight
+            else:
+                total_loss = total_loss + step_loss
+                num_steps += 1
 
             state, x0_full, confidence_full, x = diffusion_step_update(
                 x, logits, i, current_steps, timesteps, mask_id, DIFFUSION_ALG, DIFFUSION_ALG_TEMP,
@@ -657,6 +667,8 @@ def main():
                         print(f"{pos:<6} | {_cell(s_sampled, W)} | {_cell(s_updated, W)} | {conf:>7.4f} | {_cell(s_target, W)}")
                     print("=" * (6 + 3 + W * 3 + 8 + 3 + W + 12))
             i += 1
+        if USE_STEP_WEIGHTED_LOSS:
+            return total_loss / max(total_weight, 1.0)
         return total_loss / max(num_steps, 1)
 
 

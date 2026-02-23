@@ -312,7 +312,7 @@ def main():
         for i in range(len(input_ids_lm)):
             rem = max_len - input_ids_lm[i].size(0)
             if rem > 0:
-                r_pad = torch.full((rem,), pad_id, dtype=torch.long)
+                r_pad = torch.full((rem,), mask_id, dtype=torch.long)
                 r_lbl = torch.full((rem,), pad_id, dtype=torch.long)                
                 padded_inputs.append(torch.cat([input_ids_lm[i], r_pad]))
                 padded_labels.append(torch.cat([labels_lm[i], r_lbl]))
@@ -535,6 +535,14 @@ def main():
             logits, temperature=temperature, top_p=top_p, top_k=top_k,
             margin_confidence=(alg == 'topk_margin'), neg_entropy=(alg == 'entropy')
         )
+        # Only update non-mask positions inside generation region (do not overwrite prompt)
+        B, L = x_next.shape
+        if start_pos_1d is not None:
+            in_gen_region = torch.arange(L, device=device).unsqueeze(0) >= start_pos_1d.unsqueeze(1)  # (B, L)
+            update_non_mask = ~mask_index & in_gen_region
+        else:
+            update_non_mask = ~mask_index
+
         if not alg == 'confidence_threshold':
             t = timesteps[i]
             s = timesteps[i + 1]
@@ -545,7 +553,7 @@ def main():
             transfer_index_t_s = torch.rand(*x0.shape, device=device) < p_transfer
             x0[transfer_index_t_s] = x0_full[mask_index][transfer_index_t_s]
             x_next[mask_index] = x0.clone()
-            x_next[~mask_index] = x0_full[~mask_index]
+            x_next[update_non_mask] = x0_full[update_non_mask]
         elif alg == 'confidence_threshold':
             _apply_ast_confidence_weighting(confidence_full, x_next, mask_index, x0_full, tokenizer, start_pos_1d, extract_code_from_output_fn, generate_char_weights_from_dag_fn)
             number_transfer_tokens = state["number_transfer_tokens"]
@@ -568,7 +576,7 @@ def main():
                         state["steps"] = state.get("steps", steps) + 1
                         state["left_tokens_last_step"] += 1
                         transfer_index[0, select_index[0, k]] = False
-            x_next[~mask_index] = x0_full[~mask_index]
+            x_next[update_non_mask] = x0_full[update_non_mask]
             x_next[transfer_index] = x0_full[transfer_index]
         else:
             if alg not in ('maskgit_plus', 'topk_margin', 'entropy'):
@@ -578,7 +586,7 @@ def main():
             number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps - 1 else int(num_mask_token)
             full_confidence = torch.full_like(x_next, -torch.inf, device=device, dtype=logits.dtype)
             full_confidence[mask_index] = confidence_full[mask_index]
-            x_next[~mask_index] = x0_full[~mask_index]
+            x_next[update_non_mask] = x0_full[update_non_mask]
             if number_transfer_tokens > 0:
                 if alg_temp is None or alg_temp == 0:
                     _, transfer_index = torch.topk(full_confidence, number_transfer_tokens)

@@ -2,9 +2,22 @@ import os
 from eval.evaluator import Evaluator
 
 # 1. 定义文件路径
-input_file = "results/test_verified/dream-7b-base_len512_steps512_block32/generation_results_processed.jsonl"
+input_file = "results/test_verified/dream-7b-instruct_len512_steps512_block512/generation_results_processed.jsonl"
 output_dir = "results"
-run_name = "test_verified/dream-7b-base_len512_steps512_block32"
+run_name = "test_verified/dream-7b-instruct_len512_steps512_block512"
+
+import argparse
+
+parser = argparse.ArgumentParser(description="Batch evaluation for code generation results.")
+parser.add_argument('--input_file', type=str, required=True, help='Path to the processed generation results (.jsonl)')
+parser.add_argument('--output_dir', type=str, default="results", help='Directory to save batch eval results')
+parser.add_argument('--run_name', type=str, required=True, help='Name for this eval run (used as subdirectory)')
+
+args = parser.parse_args()
+
+input_file = args.input_file
+output_dir = args.output_dir
+run_name = args.run_name
 
 # 2. 检查输入文件是否存在
 if not os.path.exists(input_file):

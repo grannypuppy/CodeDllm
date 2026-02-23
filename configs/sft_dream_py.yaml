@@ -5,13 +5,13 @@ wandb:
 
 experiment:
     project: "sft_dream_py" # need to be same of this file name
-    wandb_run_name: "5e-7lr_2lm_8ga_2gpus_p0-1_masktime7_forcefullmask_1000traincases_2epochs" # your wandb run name
+    wandb_run_name: "5e-7lr_2lm_8ga_4gpus_m7_1000traincases_2epochs" # your wandb run name
     num_node: 1 # the number of machines you have
 
 
 model:
     # pretrained_model: "projects/sft_dream_py/overfit_5e-7lr_1lm_2ga_4gpus_p0.1-0.7_masktime4_chatformat/checkpoint-100" # 请务必将这里替换为您的 dream 预训练模型所在的绝对路径
-    pretrained_model: "./projects/sft_dream_py/5e-7lr_2lm_8ga_2gpus_p0-1_masktime7_forcefullmask_1000traincases/final" 
+    pretrained_model: "../dLLM-RL/local_models/dream-7b-base" 
     
 # sft dataset
 dataset:
@@ -27,8 +27,10 @@ training:
     seed: 10086
     num_train_epochs: 2
     max_grad_norm: 1
-    ckpt_interval: 50 # 保存模型的间隔步数
-    val_loss_interval: 50 # 计算验证集loss的间隔步数
+    ckpt_interval: 10 # 每N步保存一次 HuggingFace 格式模型（轻量）
+    # resumable_ckpt_interval: 50 # 每N步保存完整状态（含optimizer/scheduler/RNG，可恢复训练）；必须是 ckpt_interval 的倍数
+    # checkpoints_total_limit: 5 # 最多保留的 checkpoint 数量，超出则删除最旧的；不设则不限制
+    val_loss_interval: 10 # 计算验证集loss的间隔步数
     method: "random_masking" # "random_masking""semi-ar"
     lower_p: 0.0
     upper_p: 1.0

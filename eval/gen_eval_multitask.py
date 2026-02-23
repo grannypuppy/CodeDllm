@@ -8,8 +8,9 @@ import fire
 import types
 
 try:
-    from models.dream_online import DreamModel, DreamTokenizer
-    from models.dream_online.generation_utils_block import DreamGenerationMixin as BlockDreamGenerationMixin
+    from models.dream_multitask import DreamModel
+    from models.dream_multitask.tokenization_dream import DreamTokenizer
+    from models.dream_multitask.generation_utils_block import DreamGenerationMixin as BlockDreamGenerationMixin
 except ImportError as e:
     logger.warning(f"Could not import Dream model components: {e}. Ensure you are in the correct environment and 'model' package is available.")
     DreamModel = None
@@ -80,7 +81,7 @@ class BenchmarkGenerator:
                  alg_temp: float = 0.1,
                  top_k: int = None,
                  alg: str = "entropy",
-                 detailed_log: bool = False):
+                 resume: bool = False):
         
         def generation_tokens_hook_func(step, x, logits):
             print(f"\033[32m############ Step {step} After Remasking ############\033[0m")
@@ -115,9 +116,17 @@ class BenchmarkGenerator:
             logger.info(f"Rank {self.rank}: Processing {len(data)}/{total_samples} samples")
 
         os.makedirs(self.output_dir, exist_ok=True)
-        
-        results = []
-        
+
+        # Resume: load partial by row order (same as rank split); skip first n rows for this rank
+        if resume:
+            results = self._load_partial_results()
+            n_done = len(results)
+            if n_done > 0:
+                data = data[n_done:]
+                logger.info(f"Rank {self.rank}: Resuming from {n_done} completed rows, {len(data)} remaining")
+        else:
+            results = []
+
         for i, record in enumerate(tqdm(data, desc=f"Generating (Rank {self.rank})")):
             problem_id = record.get("problem_id")
             # Handle input field name variations: check 'input' first, then 'src_code'
@@ -160,8 +169,7 @@ class BenchmarkGenerator:
                     "block_length": block_size if use_cache else None,
                     "threshold": threshold,
                     "tokenizer": self.tokenizer,
-                    "detailed_log": detailed_log,
-                    "generation_tokens_hook_func": generation_tokens_hook_func
+                    # "generation_tokens_hook_func": generation_tokens_hook_func
                 }
                 if threshold is not None:
                     gen_kwargs["alg"] = "confidence_threshold"
@@ -195,13 +203,31 @@ class BenchmarkGenerator:
             }
             results.append(result_record)
 
-            # Periodic save
-            if (i + 1) % 2 == 0:
-                 self._save_results(results, f"generation_results_rank{self.rank}_partial.jsonl")
+            # Periodic save every 2 samples
+            if len(results) % 2 == 0:
+                self._save_results(results, f"generation_results_rank{self.rank}_partial.jsonl")
 
         # Final save
         self._save_results(results, f"generation_results_rank{self.rank}.jsonl")
         
+    def _load_partial_results(self):
+        """Load partial results from output_dir. Returns results list (order = row order after rank split)."""
+        partial_path = os.path.join(self.output_dir, f"generation_results_rank{self.rank}_partial.jsonl")
+        if not os.path.exists(partial_path):
+            return []
+        results = []
+        with open(partial_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    results.append(rec)
+                except json.JSONDecodeError:
+                    continue
+        return results
+
     def _save_results(self, results, filename):
         filepath = os.path.join(self.output_dir, filename)
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -225,7 +251,7 @@ def main(
     top_k: int = None,
     alg: str = "entropy",
     use_rsp_prefix: bool = None,
-    detailed_log: bool = False,
+    resume: bool = False,
 ):
     """
     Generate solutions for Python benchmarks using Dream model.
@@ -247,7 +273,6 @@ def main(
         top_k: Top-k sampling.
         alg: Generation algorithm.
         use_rsp_prefix: Use "Here is the optimized code:\n```python\n" prefix. Default uses USE_RSP_PREFIX.
-        detailed_log: If True, log each diffusion step with Pos / Sampled / Updated / Confidence (like sft_dream_chat).
     """
     generator = BenchmarkGenerator(
         model_path=model_path,
@@ -268,7 +293,7 @@ def main(
         temperature=temperature,
         top_k=top_k,
         alg=alg,
-        detailed_log=detailed_log,
+        resume=resume,
     )
 
 if __name__ == "__main__":
