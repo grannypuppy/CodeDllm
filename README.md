@@ -80,7 +80,8 @@ torchrun --nproc_per_node=4 --master_port=29501 eval/gen_eval_online.py \
 
 ```bash
 accelerate launch --config_file accelerate_configs/1_node_4_gpus_deepspeed_zero3.yaml     train/sft_dream_online_v1.py config=configs/sft_dream_py_online.yaml
-``` (其中 sft_dream_online_v1.py 中 USE_GROUPED_LOSS = True )
+``` 
+(其中 sft_dream_online_v1.py 中 USE_GROUPED_LOSS = True )
 
 2. CodeDllm/results/test_verified/sft_dream_online_v1_len512_steps512_block512_ckpt250
 
@@ -105,7 +106,8 @@ torchrun --nproc_per_node=4 --master_port=29501 eval/gen_eval_online.py \
 
 ```bash
 accelerate launch --config_file accelerate_configs/1_node_4_gpus_deepspeed_zero3.yaml     train/sft_dream_online_v1.py config=configs/sft_dream_py_online_1.yaml
-``` (其中 sft_dream_online_v1.py 中 USE_GROUPED_LOSS = False )
+``` 
+(其中 sft_dream_online_v1.py 中 USE_GROUPED_LOSS = False )
 
 3. CodeDllm/results/test_verified/sft_dream_online_v1_len512_steps512_block512_ckpt350
 
@@ -130,4 +132,32 @@ torchrun --nproc_per_node=4 --master_port=29501 eval/gen_eval_online.py \
 
 ```bash
 accelerate launch --config_file accelerate_configs/1_node_4_gpus_deepspeed_zero3.yaml     train/sft_dream_online_v1.py config=configs/sft_dream_py_online_2.yaml
-``` (其中 sft_dream_online_v1.py 中 USE_GROUPED_LOSS = True )
+``` 
+(其中 sft_dream_online_v1.py 中 USE_GROUPED_LOSS = True )
+
+
+-----
+
+multitask-training
+
+sft_dream_dataset_ast_multitask.py
+
+sft_dream_train_multitask_stage1.py
+
+sft_dream_train_multitask.py
+
+-----
+
+ast-training
+
+sft_dream_dataset_ast.py
+
+sft_dream_train.py
+
+-----
+
+normal random mask training
+
+sft_dream_dataset_ast_m.py / sft_dream_dataset_m.py
+
+sft_dream_train.py
