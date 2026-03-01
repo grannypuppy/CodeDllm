@@ -7,18 +7,35 @@ import json
 import pandas as pd
 import multiprocessing
 from tqdm import tqdm
+from eval.evalperf_runner import profile_script_with_evalperf
 
 class Evaluator:
-    def __init__(self, tmp_dir: str = "temp/eval", run_name: str = "dream_codenet_demo"):
+    def __init__(
+        self,
+        tmp_dir: str = "temp/eval",
+        run_name: str = "dream_codenet_demo",
+        num_runs: int = 10,
+        use_evalperf: bool = False,
+    ):
         """
         Initialize the Evaluator with a temporary directory for sandbox execution.
         
         Args:
             tmp_dir (str): Directory to store temporary files (e.g., compiled binaries).
             run_name (str): Name of the current evaluation run, used for organizing results.
+            num_runs (int): Number of times to run each task for stable evaluation (default: 5).
+            use_evalperf (bool): Use EvalPerf for instruction-count-based performance evaluation.
+                Requires: pip install "evalplus[perf]" and Linux perf enabled.
         """
         self.run_name = run_name
         self.tmp_dir = tmp_dir
+        self.num_runs = num_runs
+        self.use_evalperf = use_evalperf
+        if use_evalperf and not self.use_evalperf:
+            logger.warning(
+                "use_evalperf=True but EvalPerf not available. "
+                "Install with: pip install 'evalplus[perf]' and enable perf (Linux)."
+            )
         os.makedirs(self.tmp_dir, exist_ok=True)
         self.sandbox = PySandBox(tmp_dir=tmp_dir)
         self.testcases_cache = {}
@@ -75,7 +92,7 @@ class Evaluator:
         py_file_path = os.path.join(problem_dir, f"{idx}.py")
 
         try:
-            # Run code in sandbox
+            # Run code in sandbox for correctness
             completion_results = self.sandbox.run_python_code(
                 code=code,
                 testcases=testcases,
@@ -86,6 +103,20 @@ class Evaluator:
             # Summarize results
             completion_results_overview = summarize_results(completion_results)
             
+            # If correct: (1) multi-run for stability, (2) EvalPerf instruction count when enabled
+            evalperf_instruction_count = None
+            if completion_results_overview["correctness"]:
+                # EvalPerf: CPU instruction count per task (one-by-one)
+                if self.use_evalperf and profile_script_with_evalperf:
+                    evalperf_instruction_count = profile_script_with_evalperf(
+                        code=code,
+                        testcases=testcases,
+                        timeout_per_test=60.0,
+                        num_rounds=self.num_runs,
+                    )
+                    if evalperf_instruction_count is not None:
+                        completion_results_overview["evalperf_instruction_count"] = evalperf_instruction_count
+
             return {
                 "completion_results_details": completion_results,
                 "completion_results_overview": completion_results_overview,
@@ -93,7 +124,7 @@ class Evaluator:
             }
             
         except Exception as e:
-            logger.error(f"Execution failed for {idx}: {e}")
+            logger.error(f"Execution failed for {idx} ({problem_id}): {e}")
             return {
                 "completion_results_details": [],
                 "completion_results_overview": {"correctness": False, "error": str(e)},
@@ -193,19 +224,22 @@ class Evaluator:
         
         processed_results = []
         
-        logger.info(f"Starting batch evaluation with {num_workers} workers...")
-        
-        # Prepare arguments for workers
-        tasks = [
-            (idx, row, self.tmp_dir, self.run_name) 
-            for idx, row in enumerate(data)
-        ]
-        
-        with multiprocessing.Pool(processes=num_workers) as pool:
-            # We use a static helper to avoid pickling the entire Evaluator instance which might have open handles
-            results_iter = pool.imap(_worker_func, tasks)
-            
-            processed_results = list(tqdm(results_iter, total=len(data), desc="Evaluating"))
+        # EvalPerf's profile() spawns child processes; Pool workers are daemonic and cannot have children.
+        # When use_evalperf, run in main process (no Pool).
+        if self.use_evalperf:
+            logger.info("EvalPerf enabled; running sequentially in main process (Pool workers cannot spawn children).")
+            for idx, row in enumerate(tqdm(data, desc="Evaluating")):
+                result = _worker_func((idx, row, self.tmp_dir, self.run_name, self.num_runs, self.use_evalperf))
+                processed_results.append(result)
+        else:
+            logger.info(f"Starting batch evaluation with {num_workers} workers...")
+            tasks = [
+                (idx, row, self.tmp_dir, self.run_name, self.num_runs, self.use_evalperf)
+                for idx, row in enumerate(data)
+            ]
+            with multiprocessing.Pool(processes=num_workers) as pool:
+                results_iter = pool.imap(_worker_func, tasks)
+                processed_results = list(tqdm(results_iter, total=len(data), desc="Evaluating"))
 
         # 4. Save results
         output_file = os.path.join(run_output_dir, "batch_results.jsonl")
@@ -217,9 +251,11 @@ class Evaluator:
 
 # Standalone helper function for multiprocessing
 def _worker_func(args):
-    row_index, row_data, tmp_dir, run_name = args
-    
-    evaluator = Evaluator(tmp_dir=tmp_dir, run_name=run_name)
+    row_index, row_data, tmp_dir, run_name, num_runs, use_evalperf = args
+
+    evaluator = Evaluator(
+        tmp_dir=tmp_dir, run_name=run_name, num_runs=num_runs, use_evalperf=use_evalperf
+    )
     
     original_run_python_code = evaluator.sandbox.run_python_code
     

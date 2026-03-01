@@ -7,13 +7,16 @@ requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.12.0",
     "asyncio>=4.0.0",
+    "cirron>=0.4",
     "datasets>=4.6.0",
     "deepspeed>=0.18.6",
+    "evalplus>=0.3.1",
     "evaluate>=0.4.6",
     "flashinfer-python>=0.2.12",
     "huggingface-hub>=0.36.2",
     "ipykernel>=7.2.0",
     "liger-kernel>=0.7.0",
+    "loguru>=0.7.3",
     "math-verify>=0.9.0",
     "nest-asyncio>=1.6.0",
     "numpy>=2.4.2",
@@ -24,6 +27,7 @@ dependencies = [
     "scikit-learn>=1.8.0",
     "scipy>=1.17.1",
     "sentencepiece>=0.2.1",
+    "setuptools>=70,<82",
     "tensorboard>=2.20.0",
     "termcolor>=3.3.0",
     "torch==2.6.0",
@@ -34,3 +38,6 @@ dependencies = [
     "wandb>=0.25.0",
     "xformers>=0.0.29.post3",
 ]
+
+[project.optional-dependencies]
+perf = ["evalplus[perf]"]

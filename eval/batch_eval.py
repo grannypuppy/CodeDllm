@@ -12,6 +12,7 @@ parser = argparse.ArgumentParser(description="Batch evaluation for code generati
 parser.add_argument('--input_file', type=str, required=True, help='Path to the processed generation results (.jsonl)')
 parser.add_argument('--output_dir', type=str, default="results", help='Directory to save batch eval results')
 parser.add_argument('--run_name', type=str, required=True, help='Name for this eval run (used as subdirectory)')
+parser.add_argument('--use_evalperf', action='store_true', help='Use EvalPerf for CPU instruction-count-based performance evaluation (requires evalplus[perf], Linux)')
 
 args = parser.parse_args()
 
@@ -27,9 +28,10 @@ if not os.path.exists(input_file):
 print(f"Starting batch evaluation test...")
 print(f"Input: {input_file}")
 print(f"Output Dir: {output_dir}/{run_name}")
+print(f"EvalPerf (instruction count): {'enabled' if args.use_evalperf else 'disabled'}")
 
 # 3. 初始化 Evaluator
-evaluator = Evaluator(run_name=run_name)
+evaluator = Evaluator(run_name=run_name, use_evalperf=args.use_evalperf)
 
 try:
     evaluator.batch_evaluate_jsonl(
