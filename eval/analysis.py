@@ -41,9 +41,7 @@ def get_metrics(result_entry):
     compiled = not compilation_error
     
     # Try to get runtime, could be 'avg_run_time' or just 'runtime' depending on format variations
-    runtime = overview.get("avg_run_time")
-    if runtime is None:
-        runtime = overview.get("runtime")
+    runtime = overview.get("evalperf_instruction_count")
     if runtime is None:
         runtime = float('inf')
         
@@ -60,7 +58,7 @@ def geometric_mean(data):
         return 0.0
     return np.exp(np.mean(np.log(a)))
 
-def analyze_results(baseline_file, target_file, nrows2analyze, augmented_output=None):
+def analyze_results(baseline_file, target_file, nrows2analyze, augmented_output=None, write_augmented=True, verbose=True):
     baseline_data = load_jsonl(baseline_file)
     target_data = load_jsonl(target_file)
     
@@ -84,12 +82,14 @@ def analyze_results(baseline_file, target_file, nrows2analyze, augmented_output=
         results = entry.get("eval_results", [])
         if results:
             k = len(results)
-            print(f"Detected k={k} from the first valid entry.")
+            if verbose:
+                print(f"Detected k={k} from the first valid entry.")
             break
             
     if k == 0:
-        print("Error: Could not determine k (no eval_results found in target file).")
-        return
+        if verbose:
+            print("Error: Could not determine k (no eval_results found in target file).")
+        return None
 
     # Iterate simultaneously over baseline and target
     for i, (base_entry, target_entry) in enumerate(zip(baseline_data, target_data)):
@@ -151,6 +151,12 @@ def analyze_results(baseline_file, target_file, nrows2analyze, augmented_output=
             # 如果模型只是原样输出输入，视为无速度提升，强制记为 1 以避免异常统计
             if is_identity_output[i] and correct:
                 speedup = 1.0
+
+            if speedup == float('inf'):
+                print(f"Speedup is infinity for row {i}, runtime: {runtime}, base_runtime: {base_runtime}")
+                print(f"row {i}", base_eval_results[0]["completion_results_overview"], base_eval_results[0]["idx"])
+            print(f"row {i}", base_pid, "target:", target_eval_results[i]["completion_results_overview"], "speedup:", speedup)
+                # speedup = 1.0
             
             row_samples_metrics.append({
                 "correct": correct,
@@ -164,7 +170,8 @@ def analyze_results(baseline_file, target_file, nrows2analyze, augmented_output=
         metrics_all_rows.append(row_samples_metrics)
         augmented_entries.append(target_entry)
         
-    print(f"Analyzed {len(metrics_all_rows)} rows.")
+    if verbose:
+        print(f"Analyzed {len(metrics_all_rows)} rows.")
     # if mismatched_count > 0:
     #     print(f"Skipped {mismatched_count} rows due to content mismatches.")
 
@@ -305,42 +312,65 @@ def analyze_results(baseline_file, target_file, nrows2analyze, augmented_output=
     
     # 输出增广数据与不同 speedup 阈值的子集
     output_base = augmented_output or f"{target_file}.augmented.jsonl"
-    write_jsonl(output_base, target_data)
-    print(f"Augmented target written to: {output_base}")
+    if write_augmented:
+        write_jsonl(output_base, target_data)
+        if verbose:
+            print(f"Augmented target written to: {output_base}")
+        for th, rows in rows_best_gt.items():
+            out_path = f"{output_base}.best_gt{th}.jsonl"
+            write_jsonl(out_path, rows)
+            if verbose:
+                print(f"Rows with BEST speedup > {th} written to: {out_path}")
 
-    for th, rows in rows_best_gt.items():
-        out_path = f"{output_base}.best_gt{th}.jsonl"
-        write_jsonl(out_path, rows)
-        print(f"Rows with BEST speedup > {th} written to: {out_path}")
+    metrics = {
+        "compilation_best_rate": compilation_best_rate,
+        "compilation_avg_rate": compilation_avg_rate,
+        "pass_best_rate": pass_best_rate,
+        "pass_avg_rate": pass_avg_rate,
+        "amean_best": amean_best,
+        "amean_avg": amean_avg,
+        "pct_best_gt_1_1": pct_best_gt_1_1,
+        "pct_avg_gt_1_1": pct_avg_gt_1_1,
+        "pct_best_gt_1_2": pct_best_gt_1_2,
+        "pct_avg_gt_1_2": pct_avg_gt_1_2,
+        "pct_best_gt_1_5": pct_best_gt_1_5,
+        "pct_avg_gt_1_5": pct_avg_gt_1_5,
+        "k": k,
+        "total_rows": total_rows,
+        "pass_counts": pass_counts,
+    }
 
-    print("\nEvaluation Analysis Results:")
-    print("=" * 40)
-    print(f"Compilation Rate (%):")
-    print(f"  Best@{k}: {compilation_best_rate:.2f}%")
-    print(f"  Avg@{k}:  {compilation_avg_rate:.2f}%")
-    print("-" * 40)
-    print(f"Pass@{k} (%):")
-    print(f"  Best@{k}: {pass_best_rate:.2f}%")
-    print(f"  Avg@{k}:  {pass_avg_rate:.2f}%")
-    print("-" * 40)
-    print(f"AMean Speedup (算术平均 = 和/总个数):")
-    print(f"  Best@{k}: {amean_best:.4f}")
-    print(f"  Avg@{k}:  {amean_avg:.4f}")
-    print("-" * 40)
-    print(f"Speedup > 1.1 (%):")
-    print(f"  Best@{k}: {pct_best_gt_1_1:.2f}%")
-    print(f"  Avg@{k}:  {pct_avg_gt_1_1:.2f}%")
-    print("-" * 40)
-    print(f"Speedup > 1.2 (%):")
-    print(f"  Best@{k}: {pct_best_gt_1_2:.2f}%")
-    print(f"  Avg@{k}:  {pct_avg_gt_1_2:.2f}%")
-    print("-" * 40)
-    print(f"Speedup > 1.5 (%):")
-    print(f"  Best@{k}: {pct_best_gt_1_5:.2f}%")
-    print(f"  Avg@{k}:  {pct_avg_gt_1_5:.2f}%")
-    print("=" * 40)
-    print(f"Solved Count:   {pass_counts}")
-    print(f"Total Analyzed: {total_rows}")
+    if verbose:
+        print("\nEvaluation Analysis Results:")
+        print("=" * 40)
+        print(f"Compilation Rate (%):")
+        print(f"  Best@{k}: {compilation_best_rate:.2f}%")
+        print(f"  Avg@{k}:  {compilation_avg_rate:.2f}%")
+        print("-" * 40)
+        print(f"Pass@{k} (%):")
+        print(f"  Best@{k}: {pass_best_rate:.2f}%")
+        print(f"  Avg@{k}:  {pass_avg_rate:.2f}%")
+        print("-" * 40)
+        print(f"AMean Speedup (算术平均 = 和/总个数):")
+        print(f"  Best@{k}: {amean_best:.4f}")
+        print(f"  Avg@{k}:  {amean_avg:.4f}")
+        print("-" * 40)
+        print(f"Speedup > 1.1 (%):")
+        print(f"  Best@{k}: {pct_best_gt_1_1:.2f}%")
+        print(f"  Avg@{k}:  {pct_avg_gt_1_1:.2f}%")
+        print("-" * 40)
+        print(f"Speedup > 1.2 (%):")
+        print(f"  Best@{k}: {pct_best_gt_1_2:.2f}%")
+        print(f"  Avg@{k}:  {pct_avg_gt_1_2:.2f}%")
+        print("-" * 40)
+        print(f"Speedup > 1.5 (%):")
+        print(f"  Best@{k}: {pct_best_gt_1_5:.2f}%")
+        print(f"  Avg@{k}:  {pct_avg_gt_1_5:.2f}%")
+        print("=" * 40)
+        print(f"Solved Count:   {pass_counts}")
+        print(f"Total Analyzed: {total_rows}")
+
+    return metrics
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Analyze code generation results benchmark.")

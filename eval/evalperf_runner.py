@@ -1,47 +1,40 @@
 """
-EvalPerf integration for profiling stdin-based scripts (e.g., CodeNet format).
-Wraps script execution as a callable and uses evalplus.perf.profile for CPU instruction counting.
-Requires: pip install "evalplus[perf]" and Linux with perf enabled (sudo echo 0 > /proc/sys/kernel/perf_event_paranoid).
+CPU instruction counting via `perf stat` subprocess.
+No evalplus/C++ wrapper needed — requires Linux with perf available
+and perf_event_paranoid <= 1:
+  sudo sh -c 'echo 1 > /proc/sys/kernel/perf_event_paranoid'
 """
-import base64
-from typing import List, Dict, Any, Optional
+import os
+import re
+import subprocess
+import tempfile
+from typing import Dict, List, Optional, Tuple
 
-from evalplus.perf.profile import profile, are_profiles_broken
+from loguru import logger
 
 
-def _make_profilable_script_code(user_code: str) -> str:
-    """Wrap stdin-based script as a callable for EvalPerf's profile()."""
-    # Encode to avoid escaping issues with quotes/newlines in user code
-    code_b64 = base64.b64encode(user_code.encode("utf-8")).decode("ascii")
-    return f'''
-import base64
-import io
-import sys
-
-__USER_CODE__ = base64.b64decode("{code_b64}").decode("utf-8")
-
-def __evalperf_run__(input_str):
-    _stdin_bak = sys.stdin
-    _stdout_bak = sys.stdout
-    # TextIOWrapper(BytesIO(...)) provides .buffer for code that uses sys.stdin.buffer
-    sys.stdin = io.TextIOWrapper(io.BytesIO(input_str.encode("utf-8")), encoding="utf-8")
-    _stdin_stream = sys.stdin
-    sys.stdout = io.StringIO()
-    # reliability_guard sets builtins.open=None; restore open(0) for stdin (common in CodeNet)
-    import builtins
-    _b = dict(builtins.__dict__)
-    def _open(file, mode="r", *a, **kw):
-        if file == 0:
-            return _stdin_stream
-        raise OSError("Only stdin (open(0)) allowed during profiling")
-    _b["open"] = _open
-    _globals = {{"__name__": "__main__", "__builtins__": _b}}
+def _run_perf_stat(script_path: str, stdin_data: str, timeout: float) -> Optional[int]:
+    """Run script under perf stat and return user-space instruction count."""
     try:
-        exec(__USER_CODE__, _globals)
-    finally:
-        sys.stdin = _stdin_bak
-        sys.stdout = _stdout_bak
-'''
+        result = subprocess.run(
+            ["perf", "stat", "-e", "instructions:u", "python", script_path],
+            input=stdin_data.encode(),
+            capture_output=True,
+            timeout=timeout,
+        )
+        m = re.search(r"([\d,]+)\s+instructions", result.stderr.decode())
+        if m:
+            return int(m.group(1).replace(",", ""))
+        logger.warning(f"perf stat: no instruction count in output for {script_path}")
+    except subprocess.TimeoutExpired:
+        logger.warning(f"perf stat timed out ({timeout}s) for {script_path}")
+    except FileNotFoundError:
+        logger.error("perf not found — install linux-perf and ensure it's on PATH")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        logger.warning(f"perf stat error: {e}")
+    return None
 
 
 def profile_script_with_evalperf(
@@ -49,38 +42,45 @@ def profile_script_with_evalperf(
     testcases: List[Dict[str, str]],
     timeout_per_test: float = 45.0,
     num_rounds: int = 5,
-) -> Optional[int]:
+) -> Tuple[Optional[List[int]], Optional[int]]:
     """
-    Profile a stdin-based script using EvalPerf's CPU instruction counter.
-    
+    Profile a stdin-based script using perf stat CPU instruction counter.
+
     Args:
-        code: Python script that reads stdin and prints to stdout.
+        code: Python script that reads stdin and writes to stdout.
         testcases: List of {"input": str, "output": str}.
-        timeout_per_test: Timeout in seconds per test input.
-        num_rounds: Number of profiling rounds (use >1 for stability).
-    
+        timeout_per_test: Per-testcase timeout in seconds.
+        num_rounds: Profiling rounds (averaged for stability).
+
     Returns:
-        Total instruction count across all testcases, or None if profiling failed.
+        (profiles, avg_count): profiles is a list of per-round total instruction
+        counts (summed across testcases); avg_count is their mean.
+        Returns (None, None) on any failure.
     """
     if not testcases:
-        return None
+        return None, None
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(code)
+        script_path = f.name
 
     try:
-        test_inputs = [(tc["input"],) for tc in testcases]
-        func_code = _make_profilable_script_code(code)
+        profiles = []
+        for _ in range(num_rounds):
+            round_total = 0
+            for tc in testcases:
+                count = _run_perf_stat(script_path, tc["input"], timeout_per_test)
+                if count is None:
+                    print(f"Error profiling script with evalperf")
+                    return None, None
+                round_total += count
+            profiles.append(round_total)
 
-        profiles = profile(
-            func_code,
-            "__evalperf_run__",
-            test_inputs,
-            timeout_second_per_test=timeout_per_test,
-            profile_rounds=num_rounds,
-        )
-
-        if are_profiles_broken(profiles):
-            return None
-
-        # profiles is List[int|float] - one per round
-        return int(sum(profiles) / len(profiles)) if profiles else None
-    except Exception:
-        return None
+        avg = int(sum(profiles) / len(profiles))
+        return profiles, avg
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return None, None
+    finally:
+        os.unlink(script_path)

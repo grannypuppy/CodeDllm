@@ -108,14 +108,17 @@ class Evaluator:
             if completion_results_overview["correctness"]:
                 # EvalPerf: CPU instruction count per task (one-by-one)
                 if self.use_evalperf and profile_script_with_evalperf:
-                    evalperf_instruction_count = profile_script_with_evalperf(
+                    evalperf_instruction_details, evalperf_instruction_count = profile_script_with_evalperf(
                         code=code,
                         testcases=testcases,
                         timeout_per_test=60.0,
                         num_rounds=self.num_runs,
                     )
                     if evalperf_instruction_count is not None:
+                        completion_results_overview["evalperf_instruction_details"] = evalperf_instruction_details
                         completion_results_overview["evalperf_instruction_count"] = evalperf_instruction_count
+                    else:
+                        print(f"Error profiling script with evalperf, {problem_id}, {idx}")
 
             return {
                 "completion_results_details": completion_results,
