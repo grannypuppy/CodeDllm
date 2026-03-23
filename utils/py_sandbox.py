@@ -3,6 +3,7 @@ import tempfile
 import subprocess
 import time
 import os
+import re
 from utils.data_structure import RunResult
 import resource
 import multiprocessing
@@ -14,7 +15,10 @@ class PySandBox:
             tmp_dir: str = 'temp/PySemRep',
             MAX_VIRTUAL_MEMORY: int = 10 * 1024 * 1024 * 50, # 500MB by default
             MAX_INSTRUCTION_COUNT: int = 1e12, # Not directly used for Python, but kept for consistency in interface
-            NUM_PROCESSES: int = 16
+            NUM_PROCESSES: int = 16,
+            evalperf: bool = False,
+            num_runs: int = 5,
+            num_warmup: int = 1
     ):
         self.tmp_dir = tmp_dir if tmp_dir else tempfile.gettempdir()
         if not os.path.exists(self.tmp_dir):
@@ -22,10 +26,35 @@ class PySandBox:
         self.MAX_VIRTUAL_MEMORY = MAX_VIRTUAL_MEMORY
         self.MAX_INSTRUCTION_COUNT = MAX_INSTRUCTION_COUNT
         self.NUM_PROCESSES = NUM_PROCESSES
+        self.evalperf = evalperf
+        self.num_runs = num_runs
+        self.num_warmup = num_warmup
 
     def limit_virtual_memory(self):
         os.setsid()
         resource.setrlimit(resource.RLIMIT_AS, (self.MAX_VIRTUAL_MEMORY, self.MAX_VIRTUAL_MEMORY * 10))
+
+    @staticmethod
+    def _parse_perf_instructions(perf_stderr: str) -> int:
+        """Parse instruction count from perf stat stderr output."""
+        match = re.search(r'([\d,]+)\s+instructions', perf_stderr)
+        if match:
+            return int(match.group(1).replace(',', ''))
+        return -1
+
+    def _run_once(self, command: list, testcase_input: str, time_out: int):
+        """Run command once, return (execution_time_ms, stdout, stderr_decoded, returncode) or raise TimeoutExpired."""
+        start_time = time.time()
+        proc = subprocess.run(
+            command,
+            input=testcase_input.encode(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=time_out,
+            preexec_fn=self.limit_virtual_memory,
+        )
+        execution_time = (time.time() - start_time) * 1000
+        return execution_time, proc.stdout, proc.stderr.decode(), proc.returncode
 
     def execute_single_python_code_with_single_testcase(
             self,
@@ -35,50 +64,58 @@ class PySandBox:
             testcase_input: str = None,
             testcase_output: str = None
     ) -> RunResult:
-        # Python execution command
-        command = [sys.executable, py_file_path]
+        if self.evalperf:
+            command = ['perf', 'stat', '-e', 'instructions', '--', sys.executable, py_file_path]
+        else:
+            command = [sys.executable, py_file_path]
 
-        try:
-            start_time = time.time()
-            execution_process = subprocess.run(
-                command,
-                input=testcase_input.encode(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=time_out,
-                preexec_fn=self.limit_virtual_memory,
-            )
-            end_time = time.time()
-            stdout, stderr = execution_process.stdout, execution_process.stderr
-            execution_time = (end_time - start_time) * 1000 # Convert to ms to be somewhat comparable to instructions/perf metrics
-        except subprocess.TimeoutExpired:
-            # clean up is handled by subprocess.run killing the process on timeout
-            print(f"Timeout in {py_file_path} with testcase {testcase_input[:20]}...")
-            return RunResult(
-                compilation_error=False,
-                execution_error=False,
-                correct=False,
-                execution_time=time_out * 1000, # Max time
-                time_limit_error=True,
-                output=""
-            )
+        # Warm-up runs (results discarded)
+        for _ in range(self.num_warmup):
+            try:
+                self._run_once(command, testcase_input, time_out)
+            except subprocess.TimeoutExpired:
+                pass
 
-        # Check if the execution was successful (return code 0)
-        if execution_process.returncode != 0:
-            return RunResult(
-                compilation_error=False,
-                execution_error=f"Execution failed: {stderr.decode()}",
-            )
+        # Measured runs
+        execution_times = []
+        instruction_counts = []
+        stdout = b""
+        for _ in range(self.num_runs):
+            try:
+                execution_time, stdout, stderr_decoded, returncode = self._run_once(command, testcase_input, time_out)
+            except subprocess.TimeoutExpired:
+                print(f"Timeout in {py_file_path} with testcase {testcase_input[:20]}...")
+                return RunResult(
+                    compilation_error=False,
+                    execution_error=False,
+                    correct=False,
+                    execution_time=time_out * 1000,
+                    time_limit_error=True,
+                    output=""
+                )
 
-        # For Python, we don't have 'perf' instruction count easily available per process without overhead.
-        # We use wall clock time or a placeholder.
-        # We also check correctness.
-        
+            if returncode != 0:
+                prog_stderr = re.sub(r'\n\s*Performance counter stats.*', '', stderr_decoded, flags=re.DOTALL).strip() if self.evalperf else stderr_decoded
+                return RunResult(
+                    compilation_error=False,
+                    execution_error=f"Execution failed: {prog_stderr}",
+                )
+
+            execution_times.append(execution_time)
+            if self.evalperf:
+                instruction_counts.append(self._parse_perf_instructions(stderr_decoded))
+
+        avg_execution_time = sum(execution_times) / len(execution_times)
+        avg_instruction_count = int(sum(instruction_counts) / len(instruction_counts)) if instruction_counts else None
+
         return RunResult(
             compilation_error=False,
             execution_error=False,
             correct=(stdout.decode().strip() == testcase_output.strip()),
-            execution_time=execution_time, 
+            execution_time=avg_execution_time,
+            instruction_count=avg_instruction_count,
+            execution_time_list=execution_times,
+            instruction_count_list=instruction_counts if instruction_counts else None,
             output=stdout.decode()
         )
 

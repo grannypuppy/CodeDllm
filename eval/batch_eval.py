@@ -19,6 +19,7 @@ args = parser.parse_args()
 input_file = args.input_file
 output_dir = args.output_dir
 run_name = args.run_name
+use_evalperf = args.use_evalperf
 
 # 2. 检查输入文件是否存在
 if not os.path.exists(input_file):

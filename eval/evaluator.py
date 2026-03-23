@@ -10,34 +10,20 @@ from tqdm import tqdm
 from eval.evalperf_runner import profile_script_with_evalperf
 
 class Evaluator:
-    def __init__(
-        self,
-        tmp_dir: str = "temp/eval",
-        run_name: str = "dream_codenet_demo",
-        num_runs: int = 10,
-        use_evalperf: bool = False,
-    ):
+    def __init__(self, tmp_dir: str = "temp/eval", run_name: str = "dream_codenet_demo", evalperf: bool = False):
         """
         Initialize the Evaluator with a temporary directory for sandbox execution.
-        
+
         Args:
             tmp_dir (str): Directory to store temporary files (e.g., compiled binaries).
             run_name (str): Name of the current evaluation run, used for organizing results.
-            num_runs (int): Number of times to run each task for stable evaluation (default: 5).
-            use_evalperf (bool): Use EvalPerf for instruction-count-based performance evaluation.
-                Requires: pip install "evalplus[perf]" and Linux perf enabled.
+            evalperf (bool): Use perf stat to measure instruction counts instead of wall-clock time.
         """
         self.run_name = run_name
         self.tmp_dir = tmp_dir
-        self.num_runs = num_runs
-        self.use_evalperf = use_evalperf
-        if use_evalperf and not self.use_evalperf:
-            logger.warning(
-                "use_evalperf=True but EvalPerf not available. "
-                "Install with: pip install 'evalplus[perf]' and enable perf (Linux)."
-            )
+        self.evalperf = evalperf
         os.makedirs(self.tmp_dir, exist_ok=True)
-        self.sandbox = PySandBox(tmp_dir=tmp_dir)
+        self.sandbox = PySandBox(tmp_dir=tmp_dir, evalperf=evalperf)
         self.testcases_cache = {}
 
     def get_testcases(self, problem_id: str) -> List[Dict]:
@@ -227,22 +213,19 @@ class Evaluator:
         
         processed_results = []
         
-        # EvalPerf's profile() spawns child processes; Pool workers are daemonic and cannot have children.
-        # When use_evalperf, run in main process (no Pool).
-        if self.use_evalperf:
-            logger.info("EvalPerf enabled; running sequentially in main process (Pool workers cannot spawn children).")
-            for idx, row in enumerate(tqdm(data, desc="Evaluating")):
-                result = _worker_func((idx, row, self.tmp_dir, self.run_name, self.num_runs, self.use_evalperf))
-                processed_results.append(result)
-        else:
-            logger.info(f"Starting batch evaluation with {num_workers} workers...")
-            tasks = [
-                (idx, row, self.tmp_dir, self.run_name, self.num_runs, self.use_evalperf)
-                for idx, row in enumerate(data)
-            ]
-            with multiprocessing.Pool(processes=num_workers) as pool:
-                results_iter = pool.imap(_worker_func, tasks)
-                processed_results = list(tqdm(results_iter, total=len(data), desc="Evaluating"))
+        logger.info(f"Starting batch evaluation with {num_workers} workers...")
+        
+        # Prepare arguments for workers
+        tasks = [
+            (idx, row, self.tmp_dir, self.run_name, self.evalperf)
+            for idx, row in enumerate(data)
+        ]
+        
+        with multiprocessing.Pool(processes=num_workers) as pool:
+            # We use a static helper to avoid pickling the entire Evaluator instance which might have open handles
+            results_iter = pool.imap(_worker_func, tasks)
+            
+            processed_results = list(tqdm(results_iter, total=len(data), desc="Evaluating"))
 
         # 4. Save results
         output_file = os.path.join(run_output_dir, "batch_results.jsonl")
@@ -254,11 +237,9 @@ class Evaluator:
 
 # Standalone helper function for multiprocessing
 def _worker_func(args):
-    row_index, row_data, tmp_dir, run_name, num_runs, use_evalperf = args
+    row_index, row_data, tmp_dir, run_name, evalperf = args
 
-    evaluator = Evaluator(
-        tmp_dir=tmp_dir, run_name=run_name, num_runs=num_runs, use_evalperf=use_evalperf
-    )
+    evaluator = Evaluator(tmp_dir=tmp_dir, run_name=run_name, evalperf=evalperf)
     
     original_run_python_code = evaluator.sandbox.run_python_code
     
@@ -267,5 +248,3 @@ def _worker_func(args):
         return original_run_python_code(*args, **kwargs)
     
     evaluator.sandbox.run_python_code = serialized_run_python_code
-    
-    return evaluator._process_single_row(row_data, row_index)
