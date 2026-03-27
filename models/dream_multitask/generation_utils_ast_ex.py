@@ -21,7 +21,6 @@ import warnings
 import copy
 import sys
 import os
-import numpy as np
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
 from loguru import logger
@@ -40,6 +39,62 @@ from transformers.utils import (
 
 # Add parent directory to path to import local modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+def extract_code_from_output(output: str) -> str:
+
+    if not output:
+        return ""
+
+    output = "```python" + output #根据prompt改的，前面prompt如果已经给了```python`，这里就加上，防止找不到
+
+    start_tag = "```python"
+    start_idx = output.find(start_tag)
+    if start_idx == -1:
+        logger.warning(f"Could not find ```python block in output")
+        return ""
+
+    start_idx += len(start_tag)
+    end_idx = output.find("```", start_idx)
+    if end_idx == -1:
+        code = output[start_idx:]
+        # code = ""
+    else:
+        code = output[start_idx:end_idx]
+
+    return code.strip()
+
+
+def scores_to_eps_ranks_masked(scores: torch.Tensor, mask: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+    """
+    Convert per-position scores to rank ids (ascending), but rank only inside current mask candidates.
+    Non-candidate positions keep rank -1 and never participate in weighting.
+    """
+    if scores.ndim != 2:
+        raise ValueError(f"`scores` must have shape (B, T), got {tuple(scores.shape)}")
+    if mask.shape != scores.shape:
+        raise ValueError(f"`mask` must match `scores` shape, got {tuple(mask.shape)} vs {tuple(scores.shape)}")
+
+    ranks = torch.full_like(scores, -1.0, dtype=scores.dtype)
+    for b in range(scores.size(0)):
+        candidate_idx = torch.where(mask[b])[0]
+        if candidate_idx.numel() == 0:
+            continue
+        candidate_scores = scores[b, candidate_idx]
+        sorted_vals, order = torch.sort(candidate_scores)
+        n = sorted_vals.size(0)
+        if n == 1:
+            sorted_ranks = torch.zeros(1, device=scores.device, dtype=scores.dtype)
+        else:
+            diff = sorted_vals[1:] - sorted_vals[:-1]
+            inc = (torch.abs(diff) > eps).to(scores.dtype)
+            sorted_ranks = torch.cat(
+                [torch.zeros(1, device=scores.device, dtype=scores.dtype), torch.cumsum(inc, dim=0)]
+            )
+        local_ranks = torch.zeros_like(candidate_scores, dtype=scores.dtype)
+        local_ranks[order] = sorted_ranks
+        ranks[b, candidate_idx] = local_ranks
+    return ranks
+
 
 def top_p_logits(logits, top_p=None):
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
@@ -95,62 +150,6 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
         confidence = torch.sum(probs * log_probs, dim=-1)
     
     return confidence, x0
-
-
-def scores_to_eps_ranks(scores: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
-    """
-    Convert per-position scores to rank ids (ascending).
-    Positions whose absolute score difference is <= eps are assigned the same rank.
-    Vectorized over sequence length to avoid Python loop and GPU syncs.
-    """
-    if scores.ndim != 2:
-        raise ValueError(f"`scores` must have shape (B, T), got {tuple(scores.shape)}")
-
-    ranks = torch.zeros_like(scores, dtype=scores.dtype)
-    for b in range(scores.size(0)):
-        row = scores[b]
-        sorted_vals, sorted_idx = torch.sort(row)
-        diff = sorted_vals[1:] - sorted_vals[:-1]
-        inc = (torch.abs(diff) > eps).to(scores.dtype)
-        sorted_ranks = torch.cat(
-            [torch.zeros(1, device=scores.device, dtype=scores.dtype), torch.cumsum(inc, dim=0)]
-        )
-        ranks[b, sorted_idx] = sorted_ranks
-    return ranks
-
-
-def scores_to_eps_ranks_masked(scores: torch.Tensor, mask: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
-    """
-    Convert per-position scores to rank ids (ascending), but rank only inside current mask candidates.
-    Non-candidate positions keep rank -1 and never participate in weighting.
-    Inner rank assignment is vectorized (diff + cumsum) to avoid Python loop and GPU syncs per step.
-    """
-    if scores.ndim != 2:
-        raise ValueError(f"`scores` must have shape (B, T), got {tuple(scores.shape)}")
-    if mask.shape != scores.shape:
-        raise ValueError(f"`mask` must match `scores` shape, got {tuple(mask.shape)} vs {tuple(scores.shape)}")
-
-    ranks = torch.full_like(scores, -1.0, dtype=scores.dtype)
-    for b in range(scores.size(0)):
-        candidate_idx = torch.where(mask[b])[0]
-        if candidate_idx.numel() == 0:
-            continue
-
-        candidate_scores = scores[b, candidate_idx]
-        sorted_vals, order = torch.sort(candidate_scores)
-        n = sorted_vals.size(0)
-        if n == 1:
-            sorted_ranks = torch.zeros(1, device=scores.device, dtype=scores.dtype)
-        else:
-            diff = sorted_vals[1:] - sorted_vals[:-1]
-            inc = (torch.abs(diff) > eps).to(scores.dtype)
-            sorted_ranks = torch.cat(
-                [torch.zeros(1, device=scores.device, dtype=scores.dtype), torch.cumsum(inc, dim=0)]
-            )
-        local_ranks = torch.zeros_like(candidate_scores, dtype=scores.dtype)
-        local_ranks[order] = sorted_ranks
-        ranks[b, candidate_idx] = local_ranks
-    return ranks
 
 
 @dataclass
@@ -486,20 +485,21 @@ class DreamGenerationMixin:
             number_transfer_tokens = mask_index.sum().item() // steps
             left_tokens_last_step = 0
         while i < steps:
-            # logger.info(f"step: {i}")
             mask_index = (x == mask_token_id)
+            logger.info(f"[Diffusion] step={i} alg={alg} num_mask_tokens={mask_index.sum().item()}")
             outputs = self(x, attention_mask, tok_idx)
-            logits = outputs.logits
-            rank_values = outputs.rank_values
-            
-            logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
-            rank_values = torch.cat([rank_values[:,:1], rank_values[:, :-1]], dim=1) # (B, T, 1)
-            rank_values = rank_values.squeeze(-1) # (B, T)
+            logits = getattr(outputs, "logits", None)
+            if logits is None:
+                logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+            rank_values = getattr(outputs, "rank_values", None)
 
-            # Design: pred = softmax(rank_head(hidden_states))
-            rank_pred = F.softmax(rank_values, dim=-1)
-            # Rank only inside current unmask candidates (current mask positions).
-            candidate_rank_ids = scores_to_eps_ranks_masked(rank_pred, mask_index, eps=rank_eps)
+            logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+            if rank_values is not None:
+                rank_values = torch.cat([rank_values[:,:1], rank_values[:, :-1]], dim=1)
+                if rank_values.dim() == 3:
+                    rank_values = rank_values.squeeze(-1)
+            else:
+                rank_values = None
 
             # this allows user-defined logits control of the intermediate steps
             logits = generation_logits_hook_func(i, x, logits)
@@ -518,25 +518,78 @@ class DreamGenerationMixin:
             elif alg == 'confidence_threshold':
                 confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
 
-                # Rank-aware confidence weighting:
-                # rank_ids are derived from pred=softmax(rank_head(hidden_states)).
-                mask_ranks = candidate_rank_ids[mask_index]
-                if mask_ranks.numel() > 0:
-                    max_rank = mask_ranks.max()
-                    # Smaller rank id (shallower) gets larger weight.
-                    inverted_weights = (1.0 + max_rank - mask_ranks) / (1.0 + max_rank)
+                # --- Code-token rank-weighted remasking: use extract_code_from_output + rank_pred (no DAG) ---
+                if tokenizer is not None and rank_values is not None and extract_code_from_output is not None:
+                    try:
+                        x_temp = x.clone()
+                        x_temp[mask_index] = x0
+                        prompt_len = input_ids.shape[1]
+                        full_text = tokenizer.decode(x_temp[0], skip_special_tokens=False)
+                        generated_text = tokenizer.decode(x_temp[0][prompt_len:], skip_special_tokens=True)
+                        code_text = extract_code_from_output(generated_text)
+                        logger.info(f"[AST][step={i}] full_text: {full_text}")
+                        logger.info(f"[AST][step={i}] code_text: {code_text}")
 
-                    mean_weight = inverted_weights.mean()
-                    if mean_weight > 1e-6:
-                        normalized_weights = inverted_weights / mean_weight
-                    else:
-                        raise RuntimeError("Mean rank weight is too small, can't normalize.")
+                        if code_text:
+                            start_idx = generated_text.find(code_text)
+                            if start_idx != -1:
+                                end_idx = start_idx + len(code_text)
+                                code_token_indices = set()
+                                full_text_reconstructed = ""
+                                token_ids_list = x_temp[0].tolist()
+                                for j in range(prompt_len, len(token_ids_list)):
+                                    token_str = tokenizer.decode([token_ids_list[j]])
+                                    tok_start = len(full_text_reconstructed)
+                                    tok_end = tok_start + len(token_str)
+                                    full_text_reconstructed += token_str
+                                    overlap_start = max(tok_start, start_idx)
+                                    overlap_end = min(tok_end, end_idx)
+                                    if overlap_start < overlap_end:
+                                        code_token_indices.add(j)
 
-                    mean_conf = confidence.mean()
-                    new_conf_subset = mean_conf + normalized_weights * (confidence - mean_conf)
-                    confidence = new_conf_subset
+                                if code_token_indices:
+                                    B, L = x.shape
+                                    code_token_mask = torch.zeros_like(mask_index, dtype=torch.bool, device=x.device)
+                                    for idx in code_token_indices:
+                                        if idx < L:
+                                            code_token_mask[0, idx] = True
+                                    code_mask = mask_index & code_token_mask
+
+                                    rank_pred = rank_values
+                                    candidate_rank_ids = scores_to_eps_ranks_masked(rank_pred, code_mask, eps=rank_eps)
+                                    code_mask_positions = torch.where(code_mask[0])[0]
+                                    if code_mask_positions.numel() > 0:
+                                        code_ranks = candidate_rank_ids[0][code_mask_positions]
+                                        max_rank = code_ranks.float().max()
+                                        # Smaller rank id -> larger weight; +1 avoids zero weight for max rank
+                                        inverted_weights = (1.0 + max_rank - code_ranks.float())
+                                        normalized_weights = inverted_weights / inverted_weights.mean()
+                                        current_mask_indices = torch.where(mask_index[0])[0]
+                                        pos_to_code_flat = {int(p): i for i, p in enumerate(code_mask_positions.tolist())}
+                                        mean_conf = confidence.mean()
+                                        for k in range(confidence.size(0)):
+                                            pos = current_mask_indices[k].item()
+                                            if pos in pos_to_code_flat:
+                                                j = pos_to_code_flat[pos]
+                                                old_conf = float(confidence[k])
+                                                confidence[k] = mean_conf + normalized_weights[j].item() * (confidence[k] - mean_conf)
+                                                new_conf = float(confidence[k])
+                                                orig_rank = float(code_ranks[j])
+                                                token_id = x0[k].item()
+                                                safe_token_str = tokenizer.decode([token_id]).replace("\n", "\\n")
+                                                logger.info(
+                                                    f"[AST-Weight][step={i}] "
+                                                    f"pos={int(pos)} token='{safe_token_str}' "
+                                                    f"orig_rank={orig_rank:.2f} weight={normalized_weights[j].item():.4f} "
+                                                    f"conf_before={old_conf:.6f} conf_after={new_conf:.6f}"
+                                                )
+                    except Exception as e:
+                        logger.warning(f"Code-token rank weighting failed: {e}")
 
                 # --- Weighted Remasking Logic End ---
+
+                mean_conf_step = float(confidence.mean())
+                logger.info(f"[AST-Conf][alg={alg}][step={i}] mean_conf={mean_conf_step:.6f}")
 
                 x_ = torch.zeros_like(x, device=self.device, dtype=torch.long) + mask_token_id
                 x_[mask_index] = x0.clone()
@@ -559,6 +612,16 @@ class DreamGenerationMixin:
                             left_tokens_last_step += 1
                             transfer_index[0, select_index[0, k]] = False
 
+                if tokenizer is not None:
+                    selected_positions = torch.where(transfer_index[0])[0].tolist()
+                    tokens_str = []
+                    for pos in selected_positions:
+                        tok_id = x_[0, pos].item()
+                        tok_str = tokenizer.decode([tok_id]).replace("\n", "\\n")
+                        tokens_str.append(f"{pos}:{tok_str}")
+                    logger.info(f"[AST-Unmask][alg={alg}][step={i}] positions={selected_positions}")
+                    logger.info(f"[AST-Unmask][alg={alg}][step={i}] tokens={tokens_str}")
+
                 x[transfer_index] = x_[transfer_index].clone()
 
             else:
@@ -570,22 +633,84 @@ class DreamGenerationMixin:
                     confidence, x0 = sample_tokens(mask_logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True)
                 else:
                     raise RuntimeError(f"Unknown alg: {alg}")
+                mean_conf_step = float(confidence.mean())
+                logger.info(f"[AST-Conf][alg={alg}][step={i}] mean_conf_before_ast={mean_conf_step:.6f}")
+                # --- Code-token rank-weighted remasking (same as confidence_threshold, no DAG, use rank_pred) ---
+                if tokenizer is not None and rank_values is not None and extract_code_from_output is not None:
+                    try:
+                        x_temp = x.clone()
+                        x_temp[mask_index] = x0
+                        prompt_len = input_ids.shape[1]
+                        B = x.shape[0]
+                        L = x.shape[1]
+                        for b in range(B):
+                            full_text_b = tokenizer.decode(x_temp[b], skip_special_tokens=False)
+                            generated_text = tokenizer.decode(x_temp[b][prompt_len:], skip_special_tokens=True)
+                            code_text = extract_code_from_output(generated_text)
+                            logger.info(f"[AST][step={i}] full_text (b={b}): {full_text_b}")
+                            logger.info(f"[AST][step={i}] code_text (b={b}): {code_text}")
+                            if not code_text:
+                                continue
+                            start_idx = generated_text.find(code_text)
+                            if start_idx == -1:
+                                continue
+                            end_idx = start_idx + len(code_text)
+                            code_token_indices = set()
+                            full_text_reconstructed = ""
+                            token_ids_list = x_temp[b].tolist()
+                            for j in range(prompt_len, len(token_ids_list)):
+                                token_str = tokenizer.decode([token_ids_list[j]])
+                                tok_start = len(full_text_reconstructed)
+                                tok_end = tok_start + len(token_str)
+                                full_text_reconstructed += token_str
+                                overlap_start = max(tok_start, start_idx)
+                                overlap_end = min(tok_end, end_idx)
+                                if overlap_start < overlap_end:
+                                    code_token_indices.add(j)
 
-                # --- Weighted Remasking Logic with Rank Prediction ---
-                mask_ranks = candidate_rank_ids[mask_index]
-                if mask_ranks.numel() > 0:
-                    max_rank = mask_ranks.max()
-                    inverted_weights = (1.0 + max_rank - mask_ranks) / (1.0 + max_rank)
+                            if not code_token_indices:
+                                continue
+                            code_token_mask_b = torch.zeros(L, dtype=torch.bool, device=x.device)
+                            for idx in code_token_indices:
+                                if idx < L:
+                                    code_token_mask_b[idx] = True
+                            code_mask_b = mask_index[b] & code_token_mask_b
+                            code_mask = torch.zeros_like(mask_index, dtype=torch.bool, device=x.device)
+                            code_mask[b] = code_mask_b
 
-                    mean_weight = inverted_weights.mean()
-                    if mean_weight > 1e-6:
-                        normalized_weights = inverted_weights / mean_weight
-                    else:
-                        raise RuntimeError("Mean rank weight is too small, can't normalize.")
-
-                    mean_conf = confidence.mean()
-                    confidence = mean_conf + normalized_weights * (confidence - mean_conf)
-
+                            rank_pred = rank_values
+                            candidate_rank_ids = scores_to_eps_ranks_masked(rank_pred, code_mask, eps=rank_eps)
+                            code_mask_positions = torch.where(code_mask[b])[0]
+                            if code_mask_positions.numel() == 0:
+                                continue
+                            code_ranks = candidate_rank_ids[b][code_mask_positions]
+                            max_rank = code_ranks.float().max()
+                            # Smaller rank id (shallower) -> larger weight; +1 avoids zero; then normalize by mean
+                            inverted_weights = (1.0 + max_rank - code_ranks.float())
+                            normalized_weights = inverted_weights / inverted_weights.mean()
+                            offset = mask_index[:b].sum().item()
+                            current_mask_indices = torch.where(mask_index[b])[0]
+                            pos_to_code_flat = {int(p): i for i, p in enumerate(code_mask_positions.tolist())}
+                            mean_conf = confidence.mean()
+                            for k in range(current_mask_indices.size(0)):
+                                pos = current_mask_indices[k].item()
+                                if pos in pos_to_code_flat:
+                                    j = pos_to_code_flat[pos]
+                                    flat_idx = offset + k
+                                    old_conf = float(confidence[flat_idx])
+                                    confidence[flat_idx] = mean_conf + normalized_weights[j].item() * (confidence[flat_idx] - mean_conf)
+                                    new_conf = float(confidence[flat_idx])
+                                    orig_rank = float(code_ranks[j])
+                                    token_id = x0[flat_idx].item()
+                                    safe_token_str = tokenizer.decode([token_id]).replace("\n", "\\n")
+                                    logger.info(
+                                        f"[AST-Weight][step={i}][b={b}] "
+                                        f"pos={int(pos)} token='{safe_token_str}' "
+                                        f"orig_rank={orig_rank:.2f} weight={normalized_weights[j].item():.4f} "
+                                        f"conf_before={old_conf:.6f} conf_after={new_conf:.6f}"
+                                    )
+                    except Exception as e:
+                        logger.warning(f"Code-token rank weighting failed: {e}")
                 # --- Weighted Remasking Logic End ---
 
                 num_mask_token = mask_index.sum() / mask_index.shape[0]
@@ -605,6 +730,17 @@ class DreamGenerationMixin:
                     x_[mask_index] = x0.clone()
                     row_indices = torch.arange(x.size(0), device=self.device).unsqueeze(1).expand_as(transfer_index)
                     x[row_indices,transfer_index] = x_[row_indices,transfer_index]
+
+                    if tokenizer is not None:
+                        for b in range(x.size(0)):
+                            selected_positions = transfer_index[b].tolist()
+                            tokens_str = []
+                            for pos in selected_positions:
+                                tok_id = x_[b, pos].item()
+                                tok_str = tokenizer.decode([tok_id]).replace("\n", "\\n")
+                                tokens_str.append(f"{pos}:{tok_str}")
+                            logger.info(f"[AST-Unmask][alg={alg}][step={i}][b={b}] positions={selected_positions}")
+                            logger.info(f"[AST-Unmask][alg={alg}][step={i}][b={b}] tokens={tokens_str}")
 
             # this allows user-defined token control of the intermediate steps
             x = generation_tokens_hook_func(i, x, logits)

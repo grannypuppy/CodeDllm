@@ -13,6 +13,7 @@ import os
 import sys
 import json
 import logging
+from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,6 +22,11 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 import torch
 
 from train.utils import get_config
+
+try:
+    from utils import set_seed
+except ImportError:
+    from CodeDllm.utils import set_seed
 
 from models.dream import DreamTokenizer, DreamConfig
 
@@ -140,15 +146,17 @@ def prepare_inputs_and_labels_for_text(
             )
             node_mapping = node_to_tokens
 
-            # Fill in depth labels for code tokens
+            # Fill in depth labels for code tokens (multi-node same token: use min depth)
             response_start_idx = len(prompt_ids)
+            idx_to_depths = defaultdict(list)
             for node_info in ast_info:
                 depth = node_info.get("depth", 0)
-                # Map token indices in response to full sequence indices
                 for tok_idx in node_info.get("token_indices", []):
                     full_idx = response_start_idx + tok_idx
                     if full_idx < len(curr_depth_labels):
-                       curr_depth_labels[full_idx] = float(depth)
+                        idx_to_depths[full_idx].append(float(depth))
+            for full_idx, depths in idx_to_depths.items():
+                curr_depth_labels[full_idx] = min(depths)
         except Exception as e:
             logger.warning("AST mapping failed for sample %d: %s", i, e)
         
@@ -317,6 +325,9 @@ def prepare_inputs_and_labels_for_text(
 
 def main():
     config = get_config()
+    seed = config.training.get("seed", None)
+    if seed is not None:
+        set_seed(seed)
     pretrained_model = config.model.pretrained_model
 
     preprocessed_dir = config.dataset.get(

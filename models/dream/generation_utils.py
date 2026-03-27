@@ -98,6 +98,7 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
 class DreamModelOutput(ModelOutput):
     sequences: torch.LongTensor = None
     history: Optional[Tuple[torch.FloatTensor]] = None
+    step_map: Optional[torch.LongTensor] = None
 
 
 class DreamGenerationConfig(GenerationConfig):
@@ -389,9 +390,14 @@ class DreamGenerationMixin:
         top_k = generation_config.top_k
 
         histories = [] if (return_dict_in_generate and output_history) else None
+        step_map = torch.zeros_like(input_ids, dtype=torch.long) if (return_dict_in_generate and output_history) else None
+        prev_mask = torch.ones_like(input_ids, dtype=torch.bool) if (return_dict_in_generate and output_history) else None
         start_time = time.time()
         # pad input_ids to max_length
         x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
+        if step_map is not None:
+            step_map = F.pad(step_map, (0, max_length - step_map.shape[1]), value=0)
+            prev_mask = F.pad(prev_mask, (0, max_length - prev_mask.shape[1]), value=True)
 
         if attention_mask is not None and torch.any(attention_mask == 0.0):
             # we do not mask the [MASK] tokens so value = 1.0
@@ -492,6 +498,12 @@ class DreamGenerationMixin:
             # this allows user-defined token control of the intermediate steps
             x = generation_tokens_hook_func(i, x, logits)
 
+            if step_map is not None:
+                current_mask = (x == mask_token_id)
+                changed = prev_mask & (~current_mask)
+                step_map[changed] = i + 1
+                prev_mask = current_mask
+
             if histories is not None:
                 histories.append(x.clone())
             i += 1
@@ -507,6 +519,7 @@ class DreamGenerationMixin:
             return DreamModelOutput(
                 sequences=x,
                 history=histories,
+                step_map=step_map,
             )
         else:
             return x

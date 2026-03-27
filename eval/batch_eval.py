@@ -27,9 +27,10 @@ if not os.path.exists(input_file):
 print(f"Starting batch evaluation test...")
 print(f"Input: {input_file}")
 print(f"Output Dir: {output_dir}/{run_name}")
+print("EvalPerf (instruction count): enabled")
 
 # 3. 初始化 Evaluator
-evaluator = Evaluator(run_name=run_name)
+evaluator = Evaluator(run_name=run_name, use_evalperf=True, num_runs=10)
 
 try:
     evaluator.batch_evaluate_jsonl(

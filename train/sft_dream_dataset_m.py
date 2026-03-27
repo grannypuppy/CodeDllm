@@ -11,6 +11,11 @@ import torch
 
 from train.utils import get_config
 
+try:
+    from utils import set_seed
+except ImportError:
+    from CodeDllm.utils import set_seed
+
 # 使用 dream 子模块，避免加载完整 model
 from models.dream import DreamTokenizer, DreamConfig
 
@@ -293,6 +298,9 @@ def prepare_inputs_and_labels_for_text(
 
 def main():
     config = get_config()
+    seed = config.training.get("seed", None)
+    if seed is not None:
+        set_seed(seed)
     pretrained_model = config.model.pretrained_model
 
     # 输出目录：优先 config.dataset.preprocessed_dir，否则 data/preprocessed/<project>/<wandb_run_name>

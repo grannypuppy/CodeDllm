@@ -22,6 +22,11 @@ import torch
 
 from train.utils import get_config
 
+try:
+    from utils import set_seed
+except ImportError:
+    from CodeDllm.utils import set_seed
+
 from models.dream import DreamTokenizer, DreamConfig
 
 logging.basicConfig(
@@ -289,6 +294,9 @@ def prepare_inputs_and_labels_for_text(
 
 def main():
     config = get_config()
+    seed = config.training.get("seed", None)
+    if seed is not None:
+        set_seed(seed)
     pretrained_model = config.model.pretrained_model
 
     preprocessed_dir = config.dataset.get(

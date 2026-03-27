@@ -7,6 +7,7 @@ to its corresponding AST node in tgt_code. This enables node-level masking.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
 
 from tree_sitter import Language, Parser
 import tree_sitter_python
@@ -212,13 +213,15 @@ def get_depth_based_masking(
         return None
 
     # Build token_idx (0-based in response) -> depth
+    # If a token belongs to multiple nodes, use the minimum depth (shallower in tree = more global).
     # Tokens not in any AST node (e.g. prefix/suffix) get depth=0 (masked last)
-    token_depth = [0] * num_response_tokens
+    token_depths_collect = defaultdict(list)
     for info in ast_node_info:
         d = info.get("depth", 0)
         for tok_idx in info.get("token_indices", []):
             if 0 <= tok_idx < num_response_tokens:
-                token_depth[tok_idx] = d
+                token_depths_collect[tok_idx].append(d)
+    token_depth = [min(token_depths_collect[i]) if i in token_depths_collect else 0 for i in range(num_response_tokens)]
 
     num_to_mask = max(1, int(ratio * num_response_tokens))
     if num_to_mask >= num_response_tokens:
@@ -263,14 +266,17 @@ def get_depth_based_code_masking(
         d = info.get("depth", 0)
         for tok_idx in info.get("token_indices", []):
             if tok_idx in code_token_indices:
-                token_depth[tok_idx] = d
+                if tok_idx not in token_depth:
+                    token_depth[tok_idx] = d
+                else:
+                    token_depth[tok_idx] = min(token_depth[tok_idx], d)
 
     code_list = list(code_token_indices)
     if num_to_mask_code >= len(code_list):
         return [response_start_pos + i for i in code_list]
 
     indices_with_depth = [(i, token_depth.get(i, 0)) for i in code_list]
-    indices_with_depth.sort(key=lambda x: (-x[1], x[0]))
+    indices_with_depth.sort(key=lambda x: (-x[1], -x[0]))
 
     selected = [response_start_pos + indices_with_depth[i][0] for i in range(num_to_mask_code)]
     return selected

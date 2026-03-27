@@ -10,7 +10,7 @@ import types
 try:
     from models.dream_multitask import DreamModel
     from models.dream_multitask.tokenization_dream import DreamTokenizer
-    from models.dream_multitask.generation_utils_ast_v import DreamGenerationMixin
+    from models.dream_multitask.generation_utils_ast_ex import DreamGenerationMixin
     from models.dream_multitask.generation_utils_block_ast import DreamGenerationMixin as BlockDreamGenerationMixin
 except ImportError as e:
     logger.warning(f"Could not import Dream model components: {e}. Ensure you are in the correct environment and 'model' package is available.")
@@ -149,52 +149,59 @@ class BenchmarkGenerator:
                 full_prompt_ids = prompt_ids + prefix_ids
             else:
                 full_prompt_ids = prompt_ids
-            input_ids = torch.tensor([full_prompt_ids], dtype=torch.long).to(self.model.device)
-            attention_mask = torch.ones_like(input_ids)
+            input_ids_single = torch.tensor([full_prompt_ids], dtype=torch.long).to(self.model.device)
+            attention_mask_single = torch.ones_like(input_ids_single)
 
             generated_outputs = []
-            
-            for _ in range(num_generations):
-                gen_kwargs = {
-                    "attention_mask": attention_mask,
-                    "max_new_tokens": max_new_tokens,
-                    "output_history": True,
-                    "return_dict_in_generate":True,
-                    "steps": diffusion_steps,
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "top_k": top_k,
-                    "alg": alg,
-                    "alg_temp": alg_temp,
-                    "use_cache": use_cache,
-                    "dual_cache": dual_cache,
-                    "block_length": block_size if use_cache else None,
-                    "threshold": threshold,
-                    "tokenizer": self.tokenizer,
-                    # "generation_tokens_hook_func": generation_tokens_hook_func
-                }
-                if threshold is not None:
-                    gen_kwargs["alg"] = "confidence_threshold"
 
+            gen_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "output_history": True,
+                "return_dict_in_generate":True,
+                "steps": diffusion_steps,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "alg": alg,
+                "alg_temp": alg_temp,
+                "use_cache": use_cache,
+                "dual_cache": dual_cache,
+                "block_length": block_size if use_cache else None,
+                "threshold": threshold,
+                "tokenizer": self.tokenizer,
+                # "generation_tokens_hook_func": generation_tokens_hook_func
+            }
+
+            if alg == "confidence_threshold":
+                batch_input_ids = input_ids_single
+                batch_attention_mask = attention_mask_single
+                batch_repeats = num_generations
+            else:
+                batch_input_ids = input_ids_single.repeat(num_generations, 1)
+                batch_attention_mask = attention_mask_single.repeat(num_generations, 1)
+                batch_repeats = 1
+
+            for _ in range(batch_repeats):
                 try:
                     with torch.no_grad():
                         output = self.model.diffusion_generate(
-                            input_ids,
+                            batch_input_ids,
+                            attention_mask=batch_attention_mask,
                             **gen_kwargs
                         )
-                    
-                    # Decode
+
                     sequences = output.sequences if hasattr(output, "sequences") else output
-                    # Skip prompt tokens
-                    generated_text = self.tokenizer.decode(sequences[0, len(input_ids[0]):].tolist(), skip_special_tokens=True)
-                    generated_outputs.append(generated_text)
-                    # print(f"Generated Text: {generated_text}")
+                    for b in range(sequences.shape[0]):
+                        generated_text = self.tokenizer.decode(
+                            sequences[b, len(full_prompt_ids):].tolist(),
+                            skip_special_tokens=True,
+                        )
+                        generated_outputs.append(generated_text)
                 except Exception as e:
                     logger.error(f"Generation error for problem {problem_id}: {e}")
-                    # INSERT_YOUR_CODE
                     import traceback
                     print(traceback.format_exc())
-                    generated_outputs.append("")
+                    generated_outputs.extend([""] * int(batch_input_ids.shape[0]))
 
             # Construct result record for eval.py
             result_record = {

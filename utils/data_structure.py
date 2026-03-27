@@ -7,7 +7,10 @@ class RunResult:
             correct=False,
             execution_time=1e12,
             execution_time_type="instructions",
-            time_limit_error=False
+            time_limit_error=False,
+            instruction_count=None,
+            execution_time_list=None,
+            instruction_count_list=None
     ):
         self.compilation_error = compilation_error
         self.execution_error = execution_error
@@ -16,6 +19,9 @@ class RunResult:
         self.execution_time = execution_time
         self.execution_time_type = execution_time_type
         self.time_limit_error = time_limit_error
+        self.instruction_count = instruction_count
+        self.execution_time_list = execution_time_list
+        self.instruction_count_list = instruction_count_list
 
     @classmethod
     def from_json(cls, json_obj):
@@ -26,7 +32,10 @@ class RunResult:
             correct=json_obj.get("correct", False),
             execution_time=json_obj.get("execution_time", 1e12),
             execution_time_type=json_obj.get("execution_time_type", "instructions"),
-            time_limit_error=json_obj.get("time_limit_error", False)
+            time_limit_error=json_obj.get("time_limit_error", False),
+            instruction_count=json_obj.get("instruction_count", None),
+            execution_time_list=json_obj.get("execution_time_list", None),
+            instruction_count_list=json_obj.get("instruction_count_list", None)
         )
 
     @classmethod
@@ -38,7 +47,10 @@ class RunResult:
             correct=dict_obj.get("correct", False),
             execution_time=dict_obj.get("execution_time", 1e12),
             execution_time_type=dict_obj.get("execution_time_type", "instructions"),
-            time_limit_error=dict_obj.get("time_limit_error", False)
+            time_limit_error=dict_obj.get("time_limit_error", False),
+            instruction_count=dict_obj.get("instruction_count", None),
+            execution_time_list=dict_obj.get("execution_time_list", None),
+            instruction_count_list=dict_obj.get("instruction_count_list", None)
         )
 
     def to_dict(self):
@@ -56,7 +68,10 @@ class RunResult:
             "correct": safe(self.correct),
             "execution_time": safe(self.execution_time),
             "execution_time_type": safe(self.execution_time_type),
-            "time_limit_error": safe(self.time_limit_error)
+            "time_limit_error": safe(self.time_limit_error),
+            "instruction_count": safe(self.instruction_count),
+            "execution_time_list": safe(self.execution_time_list),
+            "instruction_count_list": safe(self.instruction_count_list)
         }
 
     def to_json(self):

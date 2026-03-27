@@ -39,7 +39,7 @@ def merge_and_process(
     world_size: int = None
 ):
     """
-    Merges parallel generation results from gen_eval.py, processes the code extraction,
+    Merges parallel generation results from gen_dream_eval.py, processes the code extraction,
     and saves to a single JSONL file with the correct original order.
 
     Args:

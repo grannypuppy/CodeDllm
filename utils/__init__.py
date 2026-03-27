@@ -6,15 +6,19 @@ def summarize_results(run_results: list[RunResult]) -> dict:
     wrong_output = any([not result.correct for result in run_results])
     correctness = all([result.correct for result in run_results])
     accuracy = sum([result.correct for result in run_results if result.correct is not None]) / len(run_results)
-    avg_run_time = sum([result.execution_time for result in run_results]) / len(run_results)
-    return {
+    avg_execution_time = sum([result.execution_time for result in run_results]) / len(run_results)
+    summary = {
         "compilation_error": compilation_error,
         "execution_error": execution_error,
         "wrong_output": wrong_output,
         "correctness": correctness,
         "accuracy": accuracy,
-        "avg_run_time": avg_run_time
+        "avg_execution_time": avg_execution_time
     }
+    instruction_counts = [r.instruction_count for r in run_results if r.instruction_count is not None]
+    if len(instruction_counts) == len(run_results) and instruction_counts:
+        summary["instruction_count"] = int(sum(instruction_counts))
+    return summary
 
 def sanitize_for_json(df):
     def safe_str(x):

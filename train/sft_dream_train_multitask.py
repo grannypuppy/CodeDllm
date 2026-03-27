@@ -33,7 +33,12 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 def _three_way_relation(values, eps):
-    """Map values to {-1, 0, +1} with eps tie region."""
+    """Map values to {-1, 0, +1} with eps tie region.
+
+    Aligned with inference rule: |dp| <= eps → same rank (tie, rel=0);
+    dp > eps → i > j (rel=+1); dp < -eps → i < j (rel=-1).
+    Uses strict > / < so that dp=eps is same rank, not different rank.
+    """
     rel = torch.zeros_like(values, dtype=torch.int8)
     rel[values > eps] = 1
     rel[values < -eps] = -1
@@ -235,7 +240,6 @@ def main():
         logger.info("Loading models and optimizer")
         tokenizer = DreamTokenizer.from_pretrained(load_path)
         
-        # 重要：使用 ignore_mismatched_sizes=True 加载，允许新加 rank_head 权重随机初始化
         model = DreamMultitaskModel.from_pretrained(
             load_path, 
             config=model_config, 
@@ -364,19 +368,30 @@ def main():
         return bias
 
 
-    def pairwise_margin_rank_loss(rank_pred, depth_labels_shift, shift_mask, rank_eps=1e-4):
+    def pairwise_margin_rank_loss(rank_pred, depth_labels_shift, shift_mask, rank_eps=1e-4, rank_eps_untie_slack=1e-6):
         """Pairwise margin rank loss from DESIGN_RANK_HEAD_MARGIN.md.
 
-        - depth_i != depth_j: max(0, eps - sign(depth_i-depth_j)*(pred_i-pred_j))
+        - depth_i != depth_j: max(0, margin_untie - sign(depth_i-depth_j)*(pred_i-pred_j)), margin_untie = eps + untie_slack
         - depth_i == depth_j: max(0, |pred_i-pred_j| - eps)
+
+        Only code tokens (depth_labels >= 0) participate; non-code tokens use depth_labels = -1 and are excluded.
+
+        Inference rule: |dp| <= eps = same rank, dp > eps / dp < -eps = different rank.
+        So for untie we require y*dp > eps (strict), using margin_untie = eps + untie_slack.
+
+        Per-sample loss: (sum of neq pair losses + sum of eq pair losses) / total_pairs_in_sample,
+        then mean over samples. So neq and eq share one denominator and are not averaged separately.
         """
         losses = []
         B = rank_pred.size(0)
-        total_pairs = torch.tensor(0.0, device=rank_pred.device, dtype=rank_pred.dtype)
-        correct_pairs = torch.tensor(0.0, device=rank_pred.device, dtype=rank_pred.dtype)
-        wrong_pairs = torch.tensor(0.0, device=rank_pred.device, dtype=rank_pred.dtype)
+        # Use integer counters for exact pair counting (no floating point drift)
+        total_pairs = torch.tensor(0, device=rank_pred.device, dtype=torch.long)
+        correct_pairs = torch.tensor(0, device=rank_pred.device, dtype=torch.long)
+        wrong_pairs = torch.tensor(0, device=rank_pred.device, dtype=torch.long)
+        margin_untie = rank_eps + rank_eps_untie_slack
         for b in range(B):
-            valid_idx = torch.where(shift_mask[b])[0]
+            # Only code tokens (depth >= 0) participate in rank loss; non-code use depth_labels = -1
+            valid_idx = torch.where(shift_mask[b] & (depth_labels_shift[b] >= 0))[0]
             if valid_idx.numel() < 2:
                 continue
             p = rank_pred[b, valid_idx]
@@ -394,8 +409,9 @@ def main():
             pred_rel = _three_way_relation(dp, rank_eps)
             label_rel = torch.sign(dd).to(torch.int8)
             match = (pred_rel == label_rel)
-            pair_cnt = torch.tensor(float(match.numel()), device=rank_pred.device, dtype=rank_pred.dtype)
-            corr_cnt = match.to(rank_pred.dtype).sum()
+            # Integer pair counts: total = correct + wrong exactly
+            pair_cnt = torch.tensor(match.numel(), device=rank_pred.device, dtype=torch.long)
+            corr_cnt = match.to(torch.long).sum()
             wrong_cnt = pair_cnt - corr_cnt
             total_pairs = total_pairs + pair_cnt
             correct_pairs = correct_pairs + corr_cnt
@@ -404,16 +420,17 @@ def main():
             neq_mask = dd != 0
             eq_mask = ~neq_mask
 
-            loss_neq = torch.tensor(0.0, device=rank_pred.device, dtype=rank_pred.dtype)
+            # Sum per-pair losses (no mean); then divide by total pairs so neq/eq share one denominator
+            loss_neq_sum = torch.tensor(0.0, device=rank_pred.device, dtype=rank_pred.dtype)
             if neq_mask.any():
                 y = torch.sign(dd[neq_mask])
-                loss_neq = F.relu(rank_eps - y * dp[neq_mask]).mean()
-
-            loss_eq = torch.tensor(0.0, device=rank_pred.device, dtype=rank_pred.dtype)
+                loss_neq_sum = F.relu(margin_untie - y * dp[neq_mask]).sum()
+            loss_eq_sum = torch.tensor(0.0, device=rank_pred.device, dtype=rank_pred.dtype)
             if eq_mask.any():
-                loss_eq = F.relu(torch.abs(dp[eq_mask]) - rank_eps).mean()
-
-            losses.append(loss_neq + loss_eq)
+                loss_eq_sum = F.relu(torch.abs(dp[eq_mask]) - rank_eps).sum()
+            num_pairs_b = dp.numel()
+            loss_b = (loss_neq_sum + loss_eq_sum) / max(num_pairs_b, 1)
+            losses.append(loss_b)
 
         if not losses:
             zero = torch.tensor(0.0, device=rank_pred.device, dtype=rank_pred.dtype)
@@ -544,13 +561,15 @@ def main():
             loss_lm = loss_lm.sum() / B
         
         # --- Rank Loss (pairwise margin) ---
-        rank_pred = F.softmax(shift_rank_values, dim=-1)
+        rank_pred = shift_rank_values
         rank_eps = config.training.get("rank_eps", 1e-4)
+        rank_eps_untie_slack = config.training.get("rank_eps_untie_slack", 1e-6)
         loss_rank, rank_stats = pairwise_margin_rank_loss(
             rank_pred,
             shift_depth_labels,
             shift_mask,
             rank_eps=rank_eps,
+            rank_eps_untie_slack=rank_eps_untie_slack,
         )
         
         # --- Total Loss ---
@@ -699,6 +718,8 @@ def main():
                         f"PairAcc={val_pair_acc:.4f} ({int(total_val_pair_correct)}/{int(total_val_pair_total)})"
                     )
 
+                    assert total_val_pair_correct + total_val_pair_wrong == total_val_pair_total, "Pair count mismatch"
+
                     if accelerator.is_main_process:
                         accelerator.log(
                             {
@@ -740,6 +761,8 @@ def main():
                     if accumulated_pair_total > 0
                     else 0.0
                 )
+
+                assert accumulated_pair_correct + accumulated_pair_wrong == accumulated_pair_total, "Pair count mismatch"
 
                 accelerator.log({
                     "train_loss": accumulated_loss,

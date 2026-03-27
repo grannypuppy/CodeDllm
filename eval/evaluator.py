@@ -7,20 +7,34 @@ import json
 import pandas as pd
 import multiprocessing
 from tqdm import tqdm
+import traceback
+from eval.evalperf_runner import profile_script_with_evalperf
 
 class Evaluator:
-    def __init__(self, tmp_dir: str = "temp/eval", run_name: str = "dream_codenet_demo"):
+    def __init__(
+        self,
+        tmp_dir: str = "temp/eval",
+        run_name: str = "dream_codenet_demo",
+        use_evalperf: bool = True,
+        num_runs: int = 5,
+    ):
         """
         Initialize the Evaluator with a temporary directory for sandbox execution.
-        
+
         Args:
             tmp_dir (str): Directory to store temporary files (e.g., compiled binaries).
             run_name (str): Name of the current evaluation run, used for organizing results.
+            use_evalperf (bool): Use perf stat to measure instruction counts instead of wall-clock time.
+            num_runs (int): Profiling rounds for evalperf task-level instruction count.
         """
         self.run_name = run_name
         self.tmp_dir = tmp_dir
+        self.use_evalperf = use_evalperf
+        self.num_runs = num_runs
         os.makedirs(self.tmp_dir, exist_ok=True)
-        self.sandbox = PySandBox(tmp_dir=tmp_dir)
+        # Keep sandbox focused on correctness execution.
+        # Instruction-count profiling is done by profile_script_with_evalperf.
+        self.sandbox = PySandBox(tmp_dir=tmp_dir, evalperf=False, num_runs=1, num_warmup=0)
         self.testcases_cache = {}
 
     def get_testcases(self, problem_id: str) -> List[Dict]:
@@ -75,7 +89,7 @@ class Evaluator:
         py_file_path = os.path.join(problem_dir, f"{idx}.py")
 
         try:
-            # Run code in sandbox
+            # Run code in sandbox for correctness
             completion_results = self.sandbox.run_python_code(
                 code=code,
                 testcases=testcases,
@@ -86,6 +100,23 @@ class Evaluator:
             # Summarize results
             completion_results_overview = summarize_results(completion_results)
             
+            # If correct: (1) multi-run for stability, (2) EvalPerf instruction count when enabled
+            instruction_count = None
+            if completion_results_overview["correctness"]:
+                # EvalPerf: CPU instruction count per task (one-by-one)
+                if self.use_evalperf and profile_script_with_evalperf:
+                    instruction_count_details, instruction_count = profile_script_with_evalperf(
+                        code=code,
+                        testcases=testcases,
+                        timeout_per_test=60.0,
+                        num_rounds=self.num_runs,
+                    )
+                    if instruction_count is not None:
+                        completion_results_overview["instruction_count_details"] = instruction_count_details
+                        completion_results_overview["instruction_count"] = instruction_count
+                    else:
+                        print(f"Error profiling script with evalperf, {problem_id}, {idx}")
+
             return {
                 "completion_results_details": completion_results,
                 "completion_results_overview": completion_results_overview,
@@ -93,7 +124,8 @@ class Evaluator:
             }
             
         except Exception as e:
-            logger.error(f"Execution failed for {idx}: {e}")
+            traceback.print_exc()
+            logger.error(f"Execution failed for {idx} ({problem_id}): {e}")
             return {
                 "completion_results_details": [],
                 "completion_results_overview": {"correctness": False, "error": str(e)},
@@ -197,7 +229,7 @@ class Evaluator:
         
         # Prepare arguments for workers
         tasks = [
-            (idx, row, self.tmp_dir, self.run_name) 
+            (idx, row, self.tmp_dir, self.run_name, self.use_evalperf, self.num_runs)
             for idx, row in enumerate(data)
         ]
         
@@ -217,9 +249,14 @@ class Evaluator:
 
 # Standalone helper function for multiprocessing
 def _worker_func(args):
-    row_index, row_data, tmp_dir, run_name = args
-    
-    evaluator = Evaluator(tmp_dir=tmp_dir, run_name=run_name)
+    row_index, row_data, tmp_dir, run_name, use_evalperf, num_runs = args
+
+    evaluator = Evaluator(
+        tmp_dir=tmp_dir,
+        run_name=run_name,
+        use_evalperf=use_evalperf,
+        num_runs=num_runs,
+    )
     
     original_run_python_code = evaluator.sandbox.run_python_code
     
@@ -228,5 +265,4 @@ def _worker_func(args):
         return original_run_python_code(*args, **kwargs)
     
     evaluator.sandbox.run_python_code = serialized_run_python_code
-    
     return evaluator._process_single_row(row_data, row_index)

@@ -1,14 +1,11 @@
 import argparse
 import shutil
 from pathlib import Path
+from collections import defaultdict
 import torch
 
 def convert_file(path: Path):
     data = torch.load(path)
-    if "depth_labels" in data:
-        print(f"{path.name}: already has depth_labels, skip.")
-        return
-
     required_keys = ["input_ids", "labels", "p_mask_lm", "start_pos", "ast_node_info", "sample_to_original_idx"]
     for k in required_keys:
         if k not in data:
@@ -33,6 +30,8 @@ def convert_file(path: Path):
             raise ValueError(f"Sample {i} has no original index mapping.")
         nodes = ast_node_info[orig]
         resp_start = int(start_pos[i].item()) if isinstance(start_pos[i], torch.Tensor) else int(start_pos[i])
+        # Multi-node same token: use min depth (same as ast_token_mapping)
+        idx_to_depths = defaultdict(list)
         for node in nodes:
             depth = node.get("depth", None)
             if depth is None:
@@ -41,7 +40,9 @@ def convert_file(path: Path):
             for tok in token_idxs:
                 full_idx = resp_start + int(tok)
                 if 0 <= full_idx < L:
-                    depth_labels[i, full_idx] = float(depth)
+                    idx_to_depths[full_idx].append(float(depth))
+        for full_idx, depths in idx_to_depths.items():
+            depth_labels[i, full_idx] = min(depths)
 
     # backup and save
     bak = path.with_suffix(path.suffix + ".bak")
