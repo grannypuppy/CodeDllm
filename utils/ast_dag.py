@@ -113,21 +113,52 @@ def get_offsets_for_slow_tokenizer(code_string: str, tokenizer):
     offset_mapping = []
     current_pos = 0
     for token in tokens:
-        # GPT-2/BPE tokenizers use 'Ġ' to represent a space.
-        # We need to convert this to a findable string.
-        findable_token = token.replace('Ġ', ' ').replace('Ċ', '\n')
-        
+        # Build multiple candidates for robust matching.
+        # 1) tokenizer-native reconstruction (best for byte-level BPE)
+        # 2) legacy marker replacement fallback
+        candidates = []
         try:
-            # Find the token in the string from the current position
-            start = code_string.index(findable_token, current_pos)
-            end = start + len(findable_token)
-            offset_mapping.append((start, end))
-            current_pos = end
-        except ValueError:
-            # This can happen if tokenization rules are complex.
-            # As a fallback, we'll just map to an empty range.
+            text_from_tokenizer = tokenizer.convert_tokens_to_string([token])
+            if text_from_tokenizer is not None:
+                candidates.append(text_from_tokenizer)
+        except Exception:
+            pass
+
+        marker_fallback = (
+            token.replace('Ġ', ' ')
+                 .replace('Ċ', '\n')
+                 .replace('ĉ', '\t')
+        )
+        candidates.append(marker_fallback)
+        candidates.append(token)
+
+        # Deduplicate while preserving order and skip empty candidates.
+        seen = set()
+        unique_candidates = []
+        for c in candidates:
+            if not c or c in seen:
+                continue
+            seen.add(c)
+            unique_candidates.append(c)
+
+        best_start = None
+        best_end = None
+        for c in unique_candidates:
+            try:
+                start = code_string.index(c, current_pos)
+                end = start + len(c)
+                if best_start is None or start < best_start:
+                    best_start, best_end = start, end
+            except ValueError:
+                continue
+
+        if best_start is not None:
+            offset_mapping.append((best_start, best_end))
+            current_pos = best_end
+        else:
+            # Keep zero-span fallback but avoid artificial current_pos drift.
+            # Drifting here can compound alignment error for following tokens.
             offset_mapping.append((current_pos, current_pos))
-            current_pos += 1
 
     return tokens, offset_mapping
 

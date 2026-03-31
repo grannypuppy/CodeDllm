@@ -1,3 +1,18 @@
+"""RL rollout script for dream_multitask (AST-guided, rank-head aware).
+
+Generates rollouts using DreamMultitaskModel with the confidence_threshold /
+other AST sampling algorithms.  In addition to the standard rollout fields
+(prompt_ids, sequence_ids, step_map, …) it saves ``rank_step_records`` – a
+per-step record of which code positions were weighted by the rank head and what
+rank values were produced.  These records are consumed by
+``rl_dream_train_multitask.py`` to compute the rank-head GRPO loss.
+
+Usage (via rl.py or directly):
+    torchrun --nproc_per_node=N models/dream_multitask/rl_rollout_ast.py \
+        config=configs/rl_dream_multitask.yaml \
+        [overrides...]
+"""
+
 import json
 import os
 import time
@@ -8,8 +23,8 @@ import torch
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from models import DreamModel, DreamTokenizer
-from models.dream.generation_utils_ast import DreamGenerationMixin
+from models.dream_multitask import DreamModel, DreamTokenizer
+from models.dream_multitask.generation_utils_ast_ex import DreamGenerationMixin
 
 
 SRC_CODE_PROMPTS_TEMPLATE = (
@@ -19,26 +34,63 @@ SRC_CODE_PROMPTS_TEMPLATE = (
 TGT_CODE_RESPONSE_PREFIX = "Here is the optimized code:\n```python\n"
 
 
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
 def get_config():
     cli_conf = OmegaConf.from_cli()
     yaml_conf = OmegaConf.load(cli_conf.config)
     return OmegaConf.merge(yaml_conf, cli_conf)
 
 
-def extract_code(text: str) -> str:
-    start_tag = "```python"
-    text = "```python" + text #根据prompt改的，前面prompt如果已经给了```python`，这里就加上，防止找不到
-    start = text.find(start_tag)
-    if start == -1:
-        print(f"Could not find ```python block in output")
-        return ""
-    start += len(start_tag)
-    end = text.find("```", start)
-    if end == -1:
-        print(f"Could not find ``` block in output")
-        return text[start:].strip()
-    return text[start:end].strip()
+def get_run_name(cfg):
+    run_name = cfg.experiment.get("run_name", None)
+    if run_name is None:
+        run_name = cfg.experiment.get("wandb_run_name", None)
+    if run_name is None:
+        raise ValueError("Missing run name: set experiment.run_name or experiment.wandb_run_name in config.")
+    return str(run_name)
 
+
+def resolve_model_path(cfg):
+    return str(cfg.model.pretrained_model)
+
+
+def get_dataset_name(cfg):
+    if cfg.experiment.function == "train":
+        train_dataset = cfg.dataset.get("train_dataset", None)
+        if train_dataset is None:
+            raise ValueError("Missing dataset.train_dataset for train rollout.")
+        return train_dataset
+    validation_dataset = cfg.dataset.get("validation_data", None)
+    if validation_dataset is None:
+        raise ValueError("Missing dataset.validation_data for evaluation rollout.")
+    return validation_dataset
+
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+def _sanitize_name_part(s: str) -> str:
+    return str(s).replace("/", ".").replace("\\", ".")
+
+
+def get_outputs_filename(model_path: str, config_path: str, current_round: int) -> str:
+    outputs_name = f"{_sanitize_name_part(model_path)}-{_sanitize_name_part(config_path)}"
+    return f"round_{current_round}-outputs-{outputs_name}.jsonl"
+
+
+def get_outputs_dirname(function_name: str) -> str:
+    if function_name == "evaluation":
+        return "eval_rollouts"
+    return "rollouts"
+
+
+# ---------------------------------------------------------------------------
+# Dataset helpers
+# ---------------------------------------------------------------------------
 
 def resolve_dataset_path(root: Path, name_or_path: str) -> Path:
     candidate = Path(name_or_path)
@@ -86,50 +138,24 @@ def build_chat_ids(tokenizer, prompt: str, use_rsp_prefix: bool = True):
     return ids
 
 
-def get_dataset_name(cfg):
-    if cfg.experiment.function == "train":
-        train_dataset = cfg.dataset.get("train_dataset", None)
-        if train_dataset is None:
-            raise ValueError("Missing dataset.train_dataset for train rollout.")
-        return train_dataset
-    validation_dataset = cfg.dataset.get("validation_data", None)
-    if validation_dataset is None:
-        raise ValueError("Missing dataset.validation_data for evaluation rollout.")
-    return validation_dataset
+def extract_code(text: str) -> str:
+    start_tag = "```python"
+    text = "```python" + text
+    start = text.find(start_tag)
+    if start == -1:
+        print("Could not find ```python block in output")
+        return ""
+    start += len(start_tag)
+    end = text.find("```", start)
+    if end == -1:
+        print("Could not find ``` block in output")
+        return text[start:].strip()
+    return text[start:end].strip()
 
 
-def _sanitize_name_part(s: str) -> str:
-    return str(s).replace("/", ".").replace("\\", ".")
-
-
-def get_outputs_name(model_path: str, config_path: str):
-    return f"{_sanitize_name_part(model_path)}-{_sanitize_name_part(config_path)}"
-
-
-def get_outputs_filename(model_path: str, config_path: str, current_round: int) -> str:
-    outputs_name = get_outputs_name(model_path, config_path)
-    return f"round_{current_round}-outputs-{outputs_name}.jsonl"
-
-
-def get_outputs_dirname(function_name: str) -> str:
-    if function_name == "evaluation":
-        return "eval_rollouts"
-    return "rollouts"
-
-
-def get_run_name(cfg):
-    run_name = cfg.experiment.get("run_name", None)
-    if run_name is None:
-        run_name = cfg.experiment.get("wandb_run_name", None)
-    if run_name is None:
-        raise ValueError("Missing run name: set experiment.run_name or experiment.wandb_run_name in config.")
-    return str(run_name)
-
-
-def resolve_model_path(cfg, root: Path, project_name: str, run_name: str):
-    return str(cfg.model.pretrained_model)
-    return str(prev_ckpt)
-
+# ---------------------------------------------------------------------------
+# Distributed helpers
+# ---------------------------------------------------------------------------
 
 def get_dist_info():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -197,6 +223,10 @@ def validate_single_node(cfg):
         )
 
 
+# ---------------------------------------------------------------------------
+# Main rollout
+# ---------------------------------------------------------------------------
+
 def main():
     cfg = get_config()
     validate_single_node(cfg)
@@ -207,7 +237,7 @@ def main():
     current_round = int(cfg.experiment.current_round)
     config_path = str(cfg.config)
 
-    model_path = resolve_model_path(cfg, root, project_name, run_name)
+    model_path = resolve_model_path(cfg)
 
     if cfg.experiment.function == "train":
         dataset_name = get_dataset_name(cfg)
@@ -227,23 +257,18 @@ def main():
     max_new_tokens = int(phase_cfg.get("max_new_tokens", 2048))
     alg = str(phase_cfg.get("alg", "entropy"))
     alg_temp = float(phase_cfg.get("alg_temp", 0.1))
-    use_cache = bool(phase_cfg.get("use_cache", False))
-    dual_cache = bool(phase_cfg.get("dual_cache", False))
-    block_size = int(phase_cfg.get("block_size", 32))
     threshold = phase_cfg.get("threshold", None)
     threshold = float(threshold) if threshold is not None else None
     use_rsp_prefix = bool(phase_cfg.get("use_rsp_prefix", True))
     output_history = bool(phase_cfg.get("output_history", True))
+    rank_eps = float(phase_cfg.get("rank_eps", 1e-4))
     return_dict_in_generate = True
 
     if rank == 0:
         print(
-            f"[rollout] mode={cfg.experiment.function} "
-            f"max_new_tokens={max_new_tokens} steps={steps} num_resp={num_resp}"
+            f"[multitask rollout] mode={cfg.experiment.function} "
+            f"max_new_tokens={max_new_tokens} steps={steps} num_resp={num_resp} alg={alg}"
         )
-
-    if use_cache:
-        raise ValueError("AST rollout currently does not support use_cache=True.")
 
     dataset_path = resolve_dataset_path(root, dataset_name)
     data = load_records(dataset_path)
@@ -260,12 +285,11 @@ def main():
         num_task_per_round = int(cfg.rollout.num_task_per_round)
         pick = min(len(data), num_task_per_round)
         if pick > 0:
-            # Keep deterministic order; round-level non-overlap is managed by rl.py.
             data = data[:pick]
 
     if world_size > 1:
         data = data[rank::world_size]
-        print(f"[rollout] rank {rank}/{world_size} processes {len(data)} samples")
+        print(f"[multitask rollout] rank {rank}/{world_size} processes {len(data)} samples")
 
     tokenizer = DreamTokenizer.from_pretrained(model_path, trust_remote_code=True, padding_side="left")
     model = DreamModel.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16).eval()
@@ -276,6 +300,7 @@ def main():
         device = torch.device("cpu")
     model = model.to(device)
 
+    # Monkey-patch multitask generation mixin
     model.diffusion_generate = types.MethodType(DreamGenerationMixin.diffusion_generate, model)
     model._sample = types.MethodType(DreamGenerationMixin._sample, model)
 
@@ -285,7 +310,7 @@ def main():
     write_path = out_path if world_size == 1 else get_rank_output_path(out_path, rank, world_size)
 
     with open(write_path, "w", encoding="utf-8") as fout:
-        for rec in tqdm(data, desc=f"dream ast rollout (rank {rank})"):
+        for rec in tqdm(data, desc=f"dream_multitask ast rollout (rank {rank})"):
             prompt = build_prompt(rec)
             prompt_ids = build_chat_ids(tokenizer, prompt, use_rsp_prefix=use_rsp_prefix)
             input_ids_single = torch.tensor([prompt_ids], dtype=torch.long, device=device)
@@ -301,14 +326,12 @@ def main():
                 "top_k": top_k,
                 "alg": alg,
                 "alg_temp": alg_temp,
-                "use_cache": use_cache,
-                "dual_cache": dual_cache,
-                "block_length": block_size if use_cache else None,
                 "threshold": threshold,
                 "tokenizer": tokenizer,
+                "rank_eps": rank_eps,
             }
 
-            # confidence_threshold in generation_utils currently enforces batch size == 1.
+            # confidence_threshold enforces batch size == 1 internally
             if alg == "confidence_threshold":
                 batch_input_ids = input_ids_single
                 batch_attention_mask = attention_mask_single
@@ -320,34 +343,49 @@ def main():
 
             for _ in range(batch_repeats):
                 with torch.no_grad():
-                    out = model.diffusion_generate(batch_input_ids, attention_mask=batch_attention_mask, **gen_kwargs)
+                    out = model.diffusion_generate(
+                        batch_input_ids,
+                        attention_mask=batch_attention_mask,
+                        **gen_kwargs,
+                    )
 
                 seq = out.sequences if hasattr(out, "sequences") else out
                 full_step_map = out.step_map if (output_history and hasattr(out, "step_map")) else None
+                full_rank_step_records = (
+                    out.rank_step_records
+                    if (output_history and hasattr(out, "rank_step_records"))
+                    else None
+                )
                 if output_history and full_step_map is None:
                     raise RuntimeError(
-                        "diffusion_generate must return step_map when return_dict_in_generate=True and output_history=True"
+                        "diffusion_generate must return step_map when "
+                        "return_dict_in_generate=True and output_history=True"
                     )
 
                 for b in range(seq.shape[0]):
                     seq_ids = seq[b].detach().cpu().tolist()
                     gen_token_ids = seq[b, len(prompt_ids):].detach().cpu().tolist()
                     generated = tokenizer.decode(gen_token_ids, skip_special_tokens=True)
+
                     if full_step_map is not None:
                         sm = full_step_map[b, len(prompt_ids):].detach().cpu().tolist()
                     else:
                         sm = []
 
-                    ext = extract_code(generated)
+                    # Serialize rank_step_records for this batch item.
+                    # Keys are stringified step indices; values have gen_positions and rank_values_old.
+                    rank_recs_serialized = {}
+                    if full_rank_step_records is not None:
+                        for step_val, info in full_rank_step_records[b].items():
+                            rank_recs_serialized[str(step_val)] = info
+
                     gen_len = len(gen_token_ids)
+                    ext = extract_code(generated)
 
                     if full_step_map is not None:
-                        assert len(sm) == gen_len, f"Step map length {len(sm)} does not match generated token length {gen_len}"
-
-                    # if len(sm) < gen_len:
-                    #     sm += [max(sm) + 1 if sm else 0] * (gen_len - len(sm))
-                    # elif len(sm) > gen_len:
-                    #     sm = sm[:gen_len]
+                        assert len(sm) == gen_len, (
+                            f"Step map length {len(sm)} does not match generated token length {gen_len}"
+                        )
 
                     row = {
                         "problem_id": rec.get("problem_id", ""),
@@ -360,6 +398,7 @@ def main():
                         "generated_output": generated,
                         "step_map": sm,
                         "extracted_output": ext,
+                        "rank_step_records": rank_recs_serialized,
                     }
                     write_jsonl_record(fout, row)
 

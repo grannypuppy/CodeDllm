@@ -156,6 +156,10 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
 class DreamModelOutput(ModelOutput):
     sequences: torch.LongTensor = None
     history: Optional[Tuple[torch.FloatTensor]] = None
+    step_map: Optional[torch.LongTensor] = None
+    # Per batch item, per step: {"gen_positions": [...], "rank_values_old": [...]}
+    # Only populated when return_dict_in_generate=True and output_history=True.
+    rank_step_records: Optional[list] = None
 
 
 class DreamGenerationConfig(GenerationConfig):
@@ -453,9 +457,18 @@ class DreamGenerationMixin:
         top_k = generation_config.top_k
 
         histories = [] if (return_dict_in_generate and output_history) else None
+        track_rl = return_dict_in_generate and output_history
+        step_map = torch.zeros_like(input_ids, dtype=torch.long) if track_rl else None
+        prev_mask = torch.ones_like(input_ids, dtype=torch.bool) if track_rl else None
+        # rank_step_records[b][step_i] = {"gen_positions": [...], "rank_values_old": [...]}
+        rank_step_records = [{} for _ in range(input_ids.shape[0])] if track_rl else None
+        prompt_len = input_ids.shape[1]
         start_time = time.time()
         # pad input_ids to max_length
         x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
+        if step_map is not None:
+            step_map = F.pad(step_map, (0, max_length - step_map.shape[1]), value=0)
+            prev_mask = F.pad(prev_mask, (0, max_length - prev_mask.shape[1]), value=True)
 
         if attention_mask is not None and torch.any(attention_mask == 0.0):
             # we do not mask the [MASK] tokens so value = 1.0
@@ -523,7 +536,6 @@ class DreamGenerationMixin:
                     try:
                         x_temp = x.clone()
                         x_temp[mask_index] = x0
-                        prompt_len = input_ids.shape[1]
                         full_text = tokenizer.decode(x_temp[0], skip_special_tokens=False)
                         generated_text = tokenizer.decode(x_temp[0][prompt_len:], skip_special_tokens=True)
                         code_text = extract_code_from_output(generated_text)
@@ -559,6 +571,13 @@ class DreamGenerationMixin:
                                     candidate_rank_ids = scores_to_eps_ranks_masked(rank_pred, code_mask, eps=rank_eps)
                                     code_mask_positions = torch.where(code_mask[0])[0]
                                     if code_mask_positions.numel() > 0:
+                                        # Record raw rank values at weighted positions for RL training
+                                        if rank_step_records is not None:
+                                            # Keys align with step_map (1-based step index, same as step_map[changed]=i+1)
+                                            rank_step_records[0][i + 1] = {
+                                                "gen_positions": (code_mask_positions - prompt_len).cpu().tolist(),
+                                                "rank_values_old": rank_values[0, code_mask_positions].float().cpu().tolist(),
+                                            }
                                         code_ranks = candidate_rank_ids[0][code_mask_positions]
                                         max_rank = code_ranks.float().max()
                                         # Smaller rank id -> larger weight; +1 avoids zero weight for max rank
@@ -640,7 +659,6 @@ class DreamGenerationMixin:
                     try:
                         x_temp = x.clone()
                         x_temp[mask_index] = x0
-                        prompt_len = input_ids.shape[1]
                         B = x.shape[0]
                         L = x.shape[1]
                         for b in range(B):
@@ -683,6 +701,12 @@ class DreamGenerationMixin:
                             code_mask_positions = torch.where(code_mask[b])[0]
                             if code_mask_positions.numel() == 0:
                                 continue
+                            # Record raw rank values at weighted positions for RL training
+                            if rank_step_records is not None:
+                                rank_step_records[b][i + 1] = {
+                                    "gen_positions": (code_mask_positions - prompt_len).cpu().tolist(),
+                                    "rank_values_old": rank_values[b, code_mask_positions].float().cpu().tolist(),
+                                }
                             code_ranks = candidate_rank_ids[b][code_mask_positions]
                             max_rank = code_ranks.float().max()
                             # Smaller rank id (shallower) -> larger weight; +1 avoids zero; then normalize by mean
@@ -745,6 +769,12 @@ class DreamGenerationMixin:
             # this allows user-defined token control of the intermediate steps
             x = generation_tokens_hook_func(i, x, logits)
 
+            if step_map is not None:
+                current_mask = (x == mask_token_id)
+                changed = prev_mask & (~current_mask)
+                step_map[changed] = i + 1
+                prev_mask = current_mask
+
             if histories is not None:
                 histories.append(x.clone())
             i += 1
@@ -760,6 +790,8 @@ class DreamGenerationMixin:
             return DreamModelOutput(
                 sequences=x,
                 history=histories,
+                step_map=step_map,
+                rank_step_records=rank_step_records,
             )
         else:
             return x

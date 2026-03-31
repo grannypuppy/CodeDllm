@@ -220,16 +220,28 @@ def get_rank_output_path(out_path: Path, rank: int, world_size: int) -> Path:
     return out_path.with_name(f"{out_path.stem}.rank{rank:02d}-of-{world_size:02d}{out_path.suffix}")
 
 
+def get_rank_done_path(rank_path: Path) -> Path:
+    """Sentinel file written by each rank after fully flushing its shard."""
+    return rank_path.with_suffix(".done")
+
+
+def signal_rank_done(rank_path: Path):
+    """Called by each rank after closing its shard file."""
+    get_rank_done_path(rank_path).touch()
+
+
 def merge_rank_outputs(out_path: Path, world_size: int, timeout_sec: int = 7200, poll_sec: float = 2.0):
     rank_paths = [get_rank_output_path(out_path, r, world_size) for r in range(world_size)]
+    done_paths = [get_rank_done_path(p) for p in rank_paths]
     deadline = time.time() + timeout_sec
+    # Wait for .done sentinels, not just file existence, to avoid reading partial shards.
     while time.time() < deadline:
-        if all(p.exists() for p in rank_paths):
+        if all(p.exists() for p in done_paths):
             break
         time.sleep(poll_sec)
     else:
-        missing = [str(p) for p in rank_paths if not p.exists()]
-        raise TimeoutError(f"Timed out waiting for rollout shards. Missing: {missing}")
+        missing = [str(rank_paths[i]) for i, p in enumerate(done_paths) if not p.exists()]
+        raise TimeoutError(f"Timed out waiting for rollout shards (.done). Missing: {missing}")
 
     with open(out_path, "w", encoding="utf-8") as fout:
         for p in rank_paths:
@@ -237,6 +249,12 @@ def merge_rank_outputs(out_path: Path, world_size: int, timeout_sec: int = 7200,
                 for line in fin:
                     if line.strip():
                         fout.write(line if line.endswith("\n") else (line + "\n"))
+
+    for p in done_paths:
+        try:
+            p.unlink()
+        except OSError:
+            pass
 
 
 def write_jsonl_record(fp, record: dict):
@@ -431,9 +449,11 @@ def run(cfg):
 
     print(f"Saved rollout shard to: {write_path}")
 
-    if world_size > 1 and rank == 0:
-        merge_rank_outputs(out_path, world_size)
-        print(f"Merged rollout outputs to: {out_path}")
+    if world_size > 1:
+        signal_rank_done(write_path)
+        if rank == 0:
+            merge_rank_outputs(out_path, world_size)
+            print(f"Merged rollout outputs to: {out_path}")
 
 
 

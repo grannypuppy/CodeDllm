@@ -1,0 +1,108 @@
+wandb:
+  entity: null
+  resume: auto
+
+accelerate:
+  train_config: "accelerate_configs/1_node_4_gpus_deepspeed_zero3.yaml"
+
+experiment:
+  project: "rl_dream_py"
+  run_name: "sft-dream-py-ckpt1000-rl-5e-7lr-2lm-8ga-4gpus-beta0.005"
+  function: "train"
+  current_round: 1
+  total_round: 40
+  eval_every: 5
+  num_node: 1
+  node_index: 0
+
+model:
+  pretrained_model: "./projects/sft_dream_py/5e-7lr_2lm_8ga_4gpus_m7_1000traincases_2epochs/checkpoint-1000"
+
+dataset:
+  # train_dataset is overridden by rl.py round planner in train mode.
+  train_dataset: "python_splits/test_verified.jsonl"
+  validation_data: "python_splits/test_verified.jsonl"
+  train_subset_dir: "python_splits/test_verified.target_bucket_subsets"
+  train_subset_files:
+    - "1_128.jsonl"
+    - "128_256.jsonl"
+    - "256_512.jsonl"
+  # rewarded_data: "projects/<project>/<run_name>/rollouts/round_<current_round>-rewarded_data.json"
+
+rollout:
+  num_task_per_round: 8
+  num_response_per_task: 8
+  use_rsp_prefix: true
+  max_new_tokens: 512
+  steps: 512
+  temperature: 0.7
+  top_p: 0.9
+  top_k: null
+  alg: "entropy"
+  alg_temp: 0.1
+  use_cache: false
+  dual_cache: false
+  threshold: null
+  output_history: true
+  subset_max_new_tokens:
+    "1_128": 128
+    "128_256": 256
+    "256_512": 512
+  subset_steps:
+    "1_128": 64
+    "128_256": 128
+    "256_512": 256
+
+evaluation:
+  dataset_limit: 100
+  num_response_per_task: 8
+  use_rsp_prefix: true
+  max_new_tokens: 512
+  steps: 512
+  temperature: 0.1
+  top_p: 0.9
+  top_k: null
+  alg: "entropy"
+  alg_temp: 0.1
+  use_cache: false
+  dual_cache: false
+  threshold: null
+  output_history: false
+
+training:
+  gradient_accumulation_steps: 8
+  batch_size_lm: 2
+  mixed_precision: "bf16"
+  enable_tf32: true
+  seed: 10086
+  num_train_epochs: 1
+  max_grad_norm: 1.0
+  method: "TraceRL"
+  shrink: 4
+  subset_shrink:
+    "1_128": 1
+    "128_256": 1
+    "256_512": 1
+  mask_times_per_sample: 4
+  lower_p: 0.0
+  upper_p: 1.0
+  eps: 0.2
+  beta: 0.0
+  use_kl_estimator_k3: true
+
+optimizer:
+  name: adamw
+  params:
+    learning_rate: 5e-7
+    scale_lr: false
+    beta1: 0.9
+    beta2: 0.99
+    weight_decay: 0.01
+    epsilon: 1e-8
+
+lr_scheduler:
+  scheduler: "cosine"
+  params:
+    learning_rate: ${optimizer.params.learning_rate}
+    warmup_steps: 0.1
+    min_lr_scale: 0

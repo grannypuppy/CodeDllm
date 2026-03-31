@@ -4,6 +4,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
+import gc
 import logging
 import math
 import json
@@ -340,6 +341,7 @@ def load_training_records(cfg, root: Path, run_name: str, current_round: int):
     records = []
     raw_rows = 0
     skipped_zero_adv = 0
+    zero_adv_rows = 0  # rows with adv==0 in file (independent of beta / filtering)
     filter_zero_adv = float(cfg.training.get("beta", 0.0)) == 0.0
     with open(outputs_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -356,6 +358,8 @@ def load_training_records(cfg, root: Path, run_name: str, current_round: int):
             if not all(k in row for k in ("prompt_ids", "sequence_ids", "generated_token_ids", "step_map")):
                 continue
             advantage = float(row["advantage"])
+            if advantage == 0.0:
+                zero_adv_rows += 1
             if filter_zero_adv and advantage == 0.0:
                 skipped_zero_adv += 1
                 continue
@@ -378,9 +382,9 @@ def load_training_records(cfg, root: Path, run_name: str, current_round: int):
     logger.info(
         "Loaded token-id records from rollout outputs: "
         f"path={outputs_path} raw_rows={raw_rows} kept={len(records)} "
-        f"skipped_zero_adv={skipped_zero_adv} filter_zero_adv={filter_zero_adv}"
+        f"skipped_zero_adv={skipped_zero_adv} zero_adv_rows={zero_adv_rows} filter_zero_adv={filter_zero_adv}"
     )
-    return records
+    return records, raw_rows, skipped_zero_adv, zero_adv_rows
 
 
 def save_checkpoint(model, tokenizer, cfg, accelerator, ckpt_name, global_step=None, epoch=None, resumable=True):
@@ -553,7 +557,7 @@ def run(cfg):
         eps=optimizer_cfg.epsilon,
     )
 
-    records = load_training_records(cfg, root, run_name, cur_round)
+    records, _raw_rows, _skipped_zero_adv, _zero_adv_rows = load_training_records(cfg, root, run_name, cur_round)
     input_ids, labels, p_mask_lm, advantages, start_pos = prepare_inputs_and_labels_from_token_ids(
         cfg,
         mask_id,
@@ -713,6 +717,10 @@ def run(cfg):
                         "train/grad_norm_pre_clip":  grad_norm_pre,
                         "train/grad_norm_post_clip": grad_norm_post,
                         "train/round":               cur_round,
+                        "train/train_num_samples":   len(records),
+                        "train/train_raw_samples":   _raw_rows,
+                        "train/train_skipped_zero_adv": _skipped_zero_adv,
+                        "train/train_zero_adv_rows":   _zero_adv_rows,
                     },
                     step=global_step,
                 )
@@ -768,6 +776,17 @@ def run(cfg):
         epoch=epoch,
         resumable=True,
     )
+
+    # Training is done; checkpoint is on disk. Drop references aggressively before teardown
+    # so NCCL / destroy_process_group sees lower peak memory.
+    del train_dl, dataset_lm
+    del records, input_ids, labels, p_mask_lm, advantages, start_pos
+    del optimizer, lr_scheduler
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
     accelerator.end_training()
 

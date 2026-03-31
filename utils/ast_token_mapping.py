@@ -11,9 +11,34 @@ from collections import defaultdict
 
 from tree_sitter import Language, Parser
 import tree_sitter_python
+import tree_sitter_cpp
 
 PYTHON_LANGUAGE = Language(tree_sitter_python.language())
-parser = Parser(PYTHON_LANGUAGE)
+CPP_LANGUAGE = Language(tree_sitter_cpp.language())
+
+
+def _normalize_lang(lang: Optional[str]) -> str:
+    s = str(lang or "python").strip().lower()
+    if s in {"py", "python"}:
+        return "python"
+    if s in {"c"}:
+        return "c"
+    if s in {"cpp", "c++", "cxx"}:
+        return "cpp"
+    # Keep backward compatibility with previous python-only behavior.
+    return "python"
+
+
+def _make_parser(language: Language) -> Parser:
+    return Parser(language)
+
+
+_PARSERS: Dict[str, Parser] = {
+    "python": _make_parser(PYTHON_LANGUAGE),
+    # parse both c/cpp with cpp grammar for robustness on mixed syntax.
+    "c": _make_parser(CPP_LANGUAGE),
+    "cpp": _make_parser(CPP_LANGUAGE),
+}
 
 # Import get_offsets_for_slow_tokenizer from ast_dag for slow tokenizers
 try:
@@ -67,6 +92,7 @@ def get_response_token_to_node_mapping(
     full_response_string: str,
     code_start_in_full: int,
     tokenizer,
+    lang: str = "python",
     max_response_tokens: Optional[int] = None,
 ) -> Tuple[Dict[int, List[int]], List[Dict[str, Any]]]:
     """
@@ -77,6 +103,7 @@ def get_response_token_to_node_mapping(
         full_response_string: Full response = prefix + tgt_code + suffix.
         code_start_in_full: Character offset where tgt_code starts in full_response_string.
         tokenizer: HF tokenizer (used with full_response_string for contextual tokenization).
+        lang: Code language ("python", "c", "cpp"; aliases accepted).
         max_response_tokens: If set, only include token indices < this (for truncated responses).
 
     Returns:
@@ -92,6 +119,10 @@ def get_response_token_to_node_mapping(
             - token_indices: list[int] (response-local token indices)
     """
     code_end_in_full = code_start_in_full + len(tgt_code)
+    lang_norm = _normalize_lang(lang)
+    parser = _PARSERS.get(lang_norm)
+    if parser is None:
+        return {}, []
 
     try:
         tree = parser.parse(bytes(tgt_code, "utf-8"))

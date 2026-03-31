@@ -53,7 +53,6 @@ def _compute_stats_from_data(data: list, function: str) -> dict:
         "correctness_rate": sum(correct)  / n,
         "compilation_rate": sum(compiled) / n,
         "mean_speedup":     sum(speedups) / n,
-        "n_samples":        n,
     }
 
 

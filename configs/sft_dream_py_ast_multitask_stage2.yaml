@@ -1,0 +1,54 @@
+wandb:
+  entity: null
+  resume: auto
+
+experiment:
+  project: sft_dream_py_ast
+  wandb_run_name: multitask_stage2_totalmean_0-5_codeonly_2e-6lr_2lm_8ga_4gpus_m7_1000traincases_2epochs
+  num_node: 1
+
+model:
+  pretrained_model: "projects/sft_dream_py_ast/multitask_stage1_totalmean_codeonly_5e-6lr_2lm_8ga_4gpus_m7_1000traincases_2epochs/checkpoint-12300"
+
+dataset:
+  optimization_data: python_splits_dllm_sft/train.json
+  validation_data: python_splits_dllm_sft/train.json
+  preprocessed_dir: "data/preprocessed/sft_dream_py_ast/random_depth_masking-1"
+
+training:
+  # resume_from_checkpoint: projects/sft_dream_py_ast/multitask_stage2_noncodeavg_2e-6lr_2lm_8ga_4gpus_m7_1000traincases_2epochs/checkpoint-1500
+  checkpoints_total_limit: 32
+  method: ast_depth_masking
+  gradient_checkpointing_enable: true
+  gradient_accumulation_steps: 8
+  batch_size_lm: 2
+  mixed_precision: bf16
+  enable_tf32: true
+  seed: 10086
+  num_train_epochs: 2
+  max_grad_norm: 4
+  ckpt_interval: 100
+  resumable_ckpt_interval: 200
+  val_loss_interval: 10
+  max_gen_length: 1024
+  max_prompt_len: 1024
+  rank_loss_weight: 0.5
+  rank_eps: 1e-4
+
+optimizer:
+  name: adamw
+  params:
+    learning_rate: 2.0e-06
+    scale_lr: false
+    beta1: 0.9
+    beta2: 0.99
+    weight_decay: 0.01
+    epsilon: 1.0e-08
+    
+lr_scheduler:
+  scheduler: cosine
+  params:
+    learning_rate: ${optimizer.params.learning_rate}
+    warmup_steps: 100
+    min_lr_scale: 0
+

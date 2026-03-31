@@ -326,13 +326,70 @@ def main():
     rollout_nproc = _get_num_processes(train_accelerate_config)
 
     # Stage script paths (absolute).
-    use_ast_rollout = bool(cfg.rollout.get("use_ast_rollout", False))
-    rollout_script_name = "rl_rollout_ast.py" if use_ast_rollout else "rl_rollout.py"
-    rollout_script = root / "models" / "dream" / rollout_script_name
-    if not rollout_script.exists():
-        raise FileNotFoundError(f"rollout script not found: {rollout_script}")
-    reward_script  = root / "reward" / "rewardmodel.py"
-    train_script   = root / "train" / "rl_dream_train.py"
+    # Dream multitask RL: always AST rollout under models/dream_multitask + dual-head train script.
+    use_dream_multitask = bool(cfg.experiment.get("use_dream_multitask", False))
+    if use_dream_multitask:
+        rollout_script = root / "models" / "dream_multitask" / "rl_rollout_ast.py"
+        rollout_script_name = "dream_multitask/rl_rollout_ast.py"
+        train_script = root / "train" / "rl_dream_train_multitask.py"
+        if not rollout_script.exists():
+            raise FileNotFoundError(f"multitask rollout script not found: {rollout_script}")
+        if not train_script.exists():
+            raise FileNotFoundError(f"multitask RL train script not found: {train_script}")
+    else:
+        use_ast_rollout = bool(cfg.rollout.get("use_ast_rollout", False))
+        rollout_script_name = "rl_rollout_ast.py" if use_ast_rollout else "rl_rollout.py"
+        rollout_script = root / "models" / "dream" / rollout_script_name
+        if not rollout_script.exists():
+            raise FileNotFoundError(f"rollout script not found: {rollout_script}")
+        train_script = root / "train" / "rl_dream_train.py"
+    reward_script = root / "reward" / "rewardmodel.py"
+
+    # One-shot evaluation only (e.g. training finished but eval crashed mid-round.)
+    # Usage: python rl.py config=... experiment.eval_only_round=5
+    # Uses ckpt/projects/<project>/<run_name>/ckpt/round_<N> and writes eval_rollouts/ like the main loop.
+    eval_only_round = cfg.experiment.get("eval_only_round", None)
+    if eval_only_round is not None:
+        eval_only_round = int(eval_only_round)
+        round_ckpt = root / "projects" / str(cfg.experiment.project) / run_name / "ckpt" / f"round_{eval_only_round}"
+        if not round_ckpt.is_dir():
+            raise FileNotFoundError(
+                f"experiment.eval_only_round={eval_only_round}: missing checkpoint dir {round_ckpt}"
+            )
+        round_ckpt_str = str(round_ckpt.resolve())
+        print(
+            f"\n[RL] ===== eval-only round {eval_only_round} (no train / no train rollouts) =====\n"
+            f"[RL] ckpt={round_ckpt_str}\n"
+            f"[RL] rollout_script={rollout_script_name}"
+        )
+        _run_rollout_stage(
+            script=rollout_script,
+            nproc=rollout_nproc,
+            root=root,
+            overrides={
+                "config": cfg_path,
+                "experiment.current_round": eval_only_round,
+                "experiment.function": "evaluation",
+                "model.pretrained_model": round_ckpt_str,
+            },
+        )
+        _run_single_stage(
+            script=reward_script,
+            root=root,
+            overrides={
+                "config": cfg_path,
+                "experiment.current_round": eval_only_round,
+                "experiment.function": "evaluation",
+                "model.pretrained_model": round_ckpt_str,
+            },
+        )
+        print(
+            f"\n[RL] eval-only for round {eval_only_round} done.\n"
+            f"[RL] Resume full loop with e.g. experiment.current_round={eval_only_round + 1} "
+            f"and model.pretrained_model={round_ckpt_str!r} (or your next starting ckpt)."
+        )
+        return
+
 
     # Data planning runs entirely in this coordinator process (no GPU needed).
     runtime_sampling_state = _init_runtime_sampling_state(cfg, run_name)
@@ -347,7 +404,10 @@ def main():
     for round_i in range(start_round, total_round + 1):
         print(f"\n[RL] ===== Round {round_i}/{total_round} =====")
         print(f"[RL] model_path={model_path}")
-        print(f"[RL] rollout_script={rollout_script_name}")
+        print(
+            f"[RL] rollout_script={rollout_script_name} "
+            f"use_dream_multitask={use_dream_multitask}"
+        )
 
         round_plan = _plan_round_train_data(
             cfg=cfg,

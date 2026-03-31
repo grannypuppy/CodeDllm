@@ -286,16 +286,10 @@ def main():
         # 1. Load config and enforce num_rank_labels=1
         model_config = DreamMultitaskConfig.from_pretrained(load_path)
         model_config.num_rank_labels = 1
-        
-        # 2. Set seed for deterministic initialization of the new rank_head
-        if config.training.seed is not None:
-            set_seed(42)  # Fixed seed as requested for new layer init
 
-        # 3. Initialize model structure (new rank_head remains randomly initialized)
         logger.info("Loading models and optimizer")
         tokenizer = DreamTokenizer.from_pretrained(load_path)
         
-        # 重要：严格校验加载，只允许 rank_head 为 missing（从 base Dream 启动时）
         model, loading_info = DreamMultitaskModel.from_pretrained(
             load_path, 
             config=model_config, 
@@ -304,11 +298,6 @@ def main():
         )
         _validate_loading_info(loading_info, allow_missing_prefixes=("rank_head.",))
         
-        # 恢复正常的训练 seed (如果之前设了42现在改回来)
-        if config.training.seed is not None:
-            set_seed(config.training.seed)
-
-
     # --- Stage 1: Freeze all parameters except the new rank_head ---
     # We MUST apply freezing logic even when resuming, to ensure the model structure (trainable params)
     # matches the optimizer state saved in the checkpoint.

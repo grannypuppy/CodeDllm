@@ -1,0 +1,52 @@
+wandb:
+  entity: null
+  resume: 'auto'
+
+experiment:
+  project: "sft_dream_py_ast"
+  wandb_run_name: "multitask_stage1_sven_bigvul_all_1_1024_astdepth_1e-4lr_3"
+  num_node: 1
+
+model:
+  pretrained_model: "/research/jiamin0630/codediffu/CodeDllm/projects/sft_dream_py_ast/multitask_stage1_sven_1_1024_astdepth_1e-4lr_2/checkpoint-200"
+
+dataset:
+  optimization_data: "sven_bigvul_sft_all_1_1024_train.json"
+  validation_data: "sven_bigvul_sft_all_1_1024_val.json"
+  preprocessed_dir: "data/preprocessed/sft_dream_py_ast/random_depth_masking-1_sven_bigvul_all_1_1024"
+
+training:
+  checkpoints_total_limit: 16
+  method: ast_depth_masking
+  gradient_checkpointing_enable: true
+  gradient_accumulation_steps: 8
+  batch_size_lm: 2
+  mixed_precision: bf16
+  enable_tf32: true
+  seed: 10086
+  num_train_epochs: 200
+  max_grad_norm: 16
+  ckpt_interval: 100
+  resumable_ckpt_interval: 100
+  val_loss_interval: 10
+  max_gen_length: 1024
+  max_prompt_len: 1024
+  rank_eps: 1e-4
+
+optimizer:
+  name: adamw
+  params:
+    learning_rate: 1e-04
+    scale_lr: false
+    beta1: 0.9
+    beta2: 0.99
+    weight_decay: 0.01
+    epsilon: 1.0e-08
+
+lr_scheduler:
+  scheduler: cosine
+  params:
+    learning_rate: ${optimizer.params.learning_rate}
+    warmup_steps: 100
+    min_lr_scale: 0
+
