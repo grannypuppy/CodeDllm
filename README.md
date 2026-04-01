@@ -1,163 +1,53 @@
-### train/ 是训练脚本
+# CodeDllm
 
-#### 现在使用的是：
+Research and engineering codebase for **diffusion language models (Diffusion LM; Dream as the main stack)** on tasks such as **code generation** and **vulnerability repair**. Built around Hugging Face–style `DreamModel` / `DreamTokenizer`, it provides full pipelines for **SFT (supervised fine-tuning)**, **semi-autoregressive sampling with AST or multitask heads**, **RL (policy gradient + reward model + rollout)**, and **SVEN-oriented data and RL variants**.
 
-1. 正常sft： `sft_dream_dataset_m.py` (构造mask) + `sft_dream_train.py` （sft训练）
+## Repository map
 
-2. online sft: `sft_dream_online.py`
+| Path | Role |
+|------|------|
+| [`models/`](models/README.md) | Dream and Dream-Multitask modeling, generation, sampling, rollout |
+| [`train/`](train/README.md) | SFT / RL training entrypoints and dataset code |
+| [`rl.py`](rl.py) / [`rl_sven.py`](rl_sven.py) | RL orchestration (data planning, multiprocess rollout, launching training) |
+| [`eval/`](eval/README.md) | Batch generation, evaluation, performance and result analysis |
+| [`reward/`](reward/README.md) | Scalar reward models (including SVEN variants) |
+| [`utils/`](utils/README.md) | Post-processing, sandbox, AST/data structures, conversion |
+| [`configs/`](configs/README.md) | OmegaConf YAML experiment configs |
+| [`accelerate_configs/`](accelerate_configs/README.md) | Accelerate + DeepSpeed ZeRO-3 configs |
+| [`scripts/`](scripts/README.md) | Shell batch drivers and data/visualization scripts |
+| [`data/`](data/README.md) | Datasets and bucket indices (large artifacts often distributed separately) |
+| [`docs/`](docs/README.md) | Design notes and pipelines (RL, semi-AR, AST, logging, etc.) |
+| [`projects/`](projects/README.md) | Default root for experiment outputs (checkpoints, logs, etc.) |
+| [`results/`](results/README.md) | Offline evaluation aggregates |
+| [`temp/`](temp/README.md) | Temporary evaluations and intermediates |
+| [`temp_utils/`](temp_utils/README.md) | One-off data inspection scripts |
+| [`wandb/`](wandb/README.md) | Local Weights & Biases run cache |
 
-3. ast online sft: `sft_dream_online_ast.py`
+## Environment
 
-+ train/其他脚本都是以前的draft
+- **Python**: Match `requirements.txt`; core deps include `torch==2.6.0`, `transformers==4.52.4`, `accelerate`, `deepspeed`, `omegaconf`, `wandb`, etc.
+- **Install**: From the repo root, `pip install -r requirements.txt` (align GPU/CUDA with your PyTorch build).
 
-#### 训练的模型保存在 projects/下面
+## Typical workflow (conceptual)
 
-1. 正常sft的在 `projects/sft_dream_py/5e-7lr_2lm_8ga_4gpus_m7_1000traincases_2epochs`
+1. **Data**: Prepare `jsonl`, bucketed subsets, or `preprocessed` `.pt` files as described under `data/`.
+2. **SFT**: Run `train/sft_dream_train*.py` with `configs/sft_*.yaml`; outputs usually go under `projects/sft_*`.
+3. **RL**: `rl.py` (or `rl_sven.py` with SVEN data) reads YAML, plans rollout subsets, worker processes run `models/dream/rl_rollout*.py`, then `train/rl_dream_train*.py` updates the policy.
+4. **Evaluation**: `eval/batch_eval.py`, `eval/gen_dream_eval*.py`, etc.; outputs land in `results/` or `temp/`.
 
-2. online的在
+For equations, tensor shapes, and default hyperparameters, see `docs/` (e.g. `CODEDLLM_RL_PIPELINE_IMPLEMENTATION_EXPLAINED.md`, `RL_DREAM_PY_YAML_PARAMETER_REFERENCE.md`).
 
-`projects/sft_dream_py/online_5e-7lr_1lm_2ga_4gpus_1000traincases_2epochs`
+## Other root files
 
-`projects/sft_dream_py/online_ast_5e-7lr_1lm_2ga_4gpus_1000traincases_2epochs`
+| File | Description |
+|------|-------------|
+| `requirements.txt` | Pinned dependencies |
+| `run.sh` | Optional local launcher stub (fill as needed) |
+| `*.log` | Training/eval logs (usually not versioned) |
 
-### eval/ 是generation 脚本
+## Notes
 
-#### generation_utils都定义在models下面
+- Some paths are listed in `.gitignore` (e.g. `data/`, `projects/`, `wandb/`, `results/`); after cloning, restore data or outputs from backup or internal storage.
+- Cursor export notes (e.g. persistent GPU memory in RL) can be copied into `docs*` and linked from here if they live on another machine.
 
-+ dream/ & dream_online/
-
-+ `generation_utils.py`  origin的diffusion loop
-+ `generation_utils_block.py`  支持block的
-+ `generation_utils_ast.py`  origin的diffusion loop + AST weight
-+ `generation_utils_block_ast.py`  支持block的 + AST weight
-
-`generation_utils_block_ast_full.py` 是 draft 
-
-#### benchmark generation 脚本是
-+ `gen_eval.py` 
-+ `gen_eval_ast.py`
-+ `gen_eval_online.py`
-+ `gen_eval_online_ast.py`
-
-script样例 `gen_eval.sh`
-
-use_cache = False 就是没有导入block generation
-
-生成的结果在 `results/test_verified`
-
-对于生成结果 应该是 `generation_results_rank*.jsonl`
-
-先用 `CodeDllm/utils/postprocess_pl.py`合成一个`generation_results_processed.jsonl` （`eval/posprocess.sh`）
-
-再用 `eval/batch_eval.py` 运行evaluate output
-
-最后用 `analysis.py` (analysis.sh) 分析结果
-
---------------
-
-1. CodeDllm/results/test_verified/sft_dream_online_v1_len512_steps512_block512_ckpt100
-
-这个结果是用： CodeDllm/projects/sft_dream_py/online_v1_1e-6lr_1lm_2ga_4gpus_1000traincases_4epochs/checkpoint-100
-
-生成结果的运行命令:
-
-```bash
-torchrun --nproc_per_node=4 --master_port=29501 eval/gen_eval_online.py \
-    --model_path projects/sft_dream_py/online_v1_1e-6lr_1lm_2ga_4gpus_1000traincases_4epochs/checkpoint-100 \
-    --output_dir results/test_verified/sft_dream_online_v1_len512_steps512_block512_ckpt100 \
-    --data_path data/python_splits/test_verified.jsonl \
-    --max_new_tokens 512 \
-    --diffusion_steps 512 \
-    --block_size 512 \
-    --use_cache False \
-    --top_p 0.9 \
-    --temperature 0.1 \
-    --num_generations 4 \
-    2>&1 | tee results/test_verified/sft_dream_online_v1_len512_steps512_block512_ckpt100/output.log
-```
-
-这个模型的训练命令和参数配置:
-
-```bash
-accelerate launch --config_file accelerate_configs/1_node_4_gpus_deepspeed_zero3.yaml     train/sft_dream_online_v1.py config=configs/sft_dream_py_online.yaml
-``` 
-(其中 sft_dream_online_v1.py 中 USE_GROUPED_LOSS = True )
-
-2. CodeDllm/results/test_verified/sft_dream_online_v1_len512_steps512_block512_ckpt250
-
-这个结果是用： CodeDllm/results/test_verified/sft_dream_online_v1_len512_steps512_block512_ckpt250
-
-生成结果的运行命令：
-
-```bash
-torchrun --nproc_per_node=4 --master_port=29501 eval/gen_eval_online.py \
-    --model_path projects/sft_dream_py/online_v1_1e-6lr_1lm_2ga_4gpus_1000traincases/checkpoint-250 \
-    --output_dir results/test_verified/sft_dream_online_v1_len512_steps512_block512_ckpt250 \
-    --data_path data/python_splits/test_verified.jsonl \
-    --max_new_tokens 512 \
-    --diffusion_steps 512 \
-    --block_size 512 \
-    --use_cache False \
-    --top_p 0.9 \
-    --temperature 0.1 \
-    --num_generations 4 \
-    2>&1 | tee results/test_verified/sft_dream_online_v1_len512_steps512_block512_ckpt250/output.log
-```
-
-```bash
-accelerate launch --config_file accelerate_configs/1_node_4_gpus_deepspeed_zero3.yaml     train/sft_dream_online_v1.py config=configs/sft_dream_py_online_1.yaml
-``` 
-(其中 sft_dream_online_v1.py 中 USE_GROUPED_LOSS = False )
-
-3. CodeDllm/results/test_verified/sft_dream_online_v1_len512_steps512_block512_ckpt350
-
-这个结果是用： CodeDllm/results/test_verified/sft_dream_online_v1_len512_steps512_block512_ckpt350
-
-生成结果的运行命令：
-
-```bash
-torchrun --nproc_per_node=4 --master_port=29501 eval/gen_eval_online.py \
-    --model_path projects/sft_dream_py/online_v1_1e-6lr_1lm_2ga_4gpus_1000traincases/checkpoint-350 \
-    --output_dir results/test_verified/sft_dream_online_v1_len512_steps512_block512_ckpt350 \
-    --data_path data/python_splits/test_verified.jsonl \
-    --max_new_tokens 512 \
-    --diffusion_steps 512 \
-    --block_size 512 \
-    --use_cache False \
-    --top_p 0.9 \
-    --temperature 0.1 \
-    --num_generations 4 \
-    2>&1 | tee results/test_verified/sft_dream_online_v1_len512_steps512_block512_ckpt350/output.log
-```
-
-```bash
-accelerate launch --config_file accelerate_configs/1_node_4_gpus_deepspeed_zero3.yaml     train/sft_dream_online_v1.py config=configs/sft_dream_py_online_2.yaml
-``` 
-(其中 sft_dream_online_v1.py 中 USE_GROUPED_LOSS = True )
-
-
------
-
-multitask-training
-
-sft_dream_dataset_ast_multitask.py
-
-sft_dream_train_multitask_stage1.py
-
-sft_dream_train_multitask.py
-
------
-
-ast-training
-
-sft_dream_dataset_ast.py
-
-sft_dream_train.py
-
------
-
-normal random mask training
-
-sft_dream_dataset_ast_m.py / sft_dream_dataset_m.py
-
-sft_dream_train.py
+Per-file descriptions for each subdirectory are in that directory’s `README.md`.

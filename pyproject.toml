@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codedllm"
+version = "0.1.0"
+description = "CodeDllm local package for research and evaluation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "transformers==4.52.4",
+    "accelerate",
+    "deepspeed",
+    "datasets",
+    "evaluate",
+    "peft",
+    "safetensors",
+    "flashinfer-python>=0.2.12",
+    "xformers",
+    "triton>=3.0.0",
+    "tqdm",
+    "numpy",
+    "scipy",
+    "pandas",
+    "scikit-learn",
+    "sentencepiece",
+    "huggingface-hub",
+    "omegaconf",
+    "liger_kernel",
+    "termcolor",
+    "asyncio",
+    "nest_asyncio",
+    "ipykernel",
+    "math_verify",
+    "loguru",
+    "fire",
+    "wandb",
+    "tensorboard",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["models*", "utils*"]
