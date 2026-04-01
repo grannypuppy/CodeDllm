@@ -41,8 +41,6 @@ rollout:
   top_k: null
   alg: "entropy"
   alg_temp: 0.1
-  use_cache: false
-  dual_cache: false
   threshold: null
   output_history: true
   # AST rank weighting epsilon (must match generation_utils_ast_ex / rollout)
@@ -67,8 +65,6 @@ evaluation:
   top_k: null
   alg: "entropy"
   alg_temp: 0.1
-  use_cache: false
-  dual_cache: false
   threshold: null
   output_history: false
   rank_eps: 1.0e-4
