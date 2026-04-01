@@ -110,8 +110,9 @@ class RewardModel:
             num_runs=reward_num_runs,
         )
 
-        default_baseline = "/research/jiamin0630/codediffu/CodeDllm/results/baseline/baseline/batch_results.jsonl"
-        self.baseline_results_path = str(cfg.get("reward", {}).get("baseline_results_path", default_baseline))
+        root = Path(__file__).resolve().parents[1]
+        default_baseline = root / "results" / "baseline" / "baseline" / "batch_results.jsonl"
+        self.baseline_results_path = str(cfg.get("reward", {}).get("baseline_results_path", str(default_baseline)))
         self._load_baseline_results(self.baseline_results_path)
 
     @staticmethod

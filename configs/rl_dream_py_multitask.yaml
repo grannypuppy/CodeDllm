@@ -3,7 +3,7 @@ wandb:
   resume: auto
 
 accelerate:
-  train_config: "accelerate_configs/1_node_4_gpus_deepspeed_zero3_multitask.yaml"
+  train_config: "accelerate_configs/1_node_4_gpus_deepspeed_zero3.yaml"
 
 experiment:
   project: "rl_dream_py"
