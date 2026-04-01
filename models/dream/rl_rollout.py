@@ -11,10 +11,6 @@ from tqdm import tqdm
 
 from models import DreamModel, DreamTokenizer
 from models.dream.generation_utils import DreamGenerationMixin
-try:
-    from models.dream.generation_utils_block import DreamGenerationMixin as BlockDreamGenerationMixin
-except ImportError:
-    BlockDreamGenerationMixin = None
 
 
 SRC_CODE_PROMPTS_TEMPLATE = (
@@ -304,9 +300,6 @@ def run(cfg):
     max_new_tokens = int(phase_cfg.get("max_new_tokens", 1024))
     alg = str(phase_cfg.get("alg", "entropy"))
     alg_temp = float(phase_cfg.get("alg_temp", 0.1))
-    use_cache = bool(phase_cfg.get("use_cache", False))
-    dual_cache = bool(phase_cfg.get("dual_cache", False))
-    block_size = int(phase_cfg.get("block_size", 32))
     threshold = phase_cfg.get("threshold", None)
     threshold = float(threshold) if threshold is not None else None
     use_rsp_prefix = bool(phase_cfg.get("use_rsp_prefix", True))
@@ -353,14 +346,8 @@ def run(cfg):
         device = torch.device("cpu")
     model = model.to(device)
 
-    if use_cache:
-        if BlockDreamGenerationMixin is None:
-            raise ImportError("use_cache=True requires models.dream.generation_utils_block but import failed.")
-        model.diffusion_generate = types.MethodType(BlockDreamGenerationMixin.diffusion_generate, model)
-        model._sample = types.MethodType(BlockDreamGenerationMixin._sample, model)
-    else:
-        model.diffusion_generate = types.MethodType(DreamGenerationMixin.diffusion_generate, model)
-        model._sample = types.MethodType(DreamGenerationMixin._sample, model)
+    model.diffusion_generate = types.MethodType(DreamGenerationMixin.diffusion_generate, model)
+    model._sample = types.MethodType(DreamGenerationMixin._sample, model)
 
     out_dir = root / "projects" / project_name / run_name / get_outputs_dirname(str(cfg.experiment.function))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -385,9 +372,6 @@ def run(cfg):
                 "top_k": top_k,
                 "alg": alg,
                 "alg_temp": alg_temp,
-                "use_cache": use_cache,
-                "dual_cache": dual_cache,
-                "block_length": block_size if use_cache else None,
                 "threshold": threshold,
                 "tokenizer": tokenizer,
             }

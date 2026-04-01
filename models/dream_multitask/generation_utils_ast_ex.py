@@ -50,7 +50,7 @@ def extract_code_from_output(output: str) -> str:
     start_tag = "```python"
     start_idx = output.find(start_tag)
     if start_idx == -1:
-        logger.warning(f"Could not find ```python block in output")
+        # logger.warning(f"Could not find ```python block in output")
         return ""
 
     start_idx += len(start_tag)
@@ -203,7 +203,7 @@ class DreamGenerationConfig(GenerationConfig):
                 try:
                     setattr(self, key, value)
                 except AttributeError as err:
-                    logger.error(f"Can't set {key} with value {value} for {self}")
+                    # logger.error(f"Can't set {key} with value {value} for {self}")
                     raise err
 
         # Validate the values of the attributes
@@ -264,12 +264,13 @@ class DreamGenerationMixin:
 
         if generation_config.max_new_tokens is not None:
             if not has_default_max_length and generation_config.max_length is not None:
-                logger.warning(
-                    f"Both `max_new_tokens` (={generation_config.max_new_tokens}) and `max_length`(="
-                    f"{generation_config.max_length}) seem to have been set. `max_new_tokens` will take precedence. "
-                    "Please refer to the documentation for more information. "
-                    "(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)"
-                )
+                # logger.warning(
+                #     f"Both `max_new_tokens` (={generation_config.max_new_tokens}) and `max_length`(="
+                #     f"{generation_config.max_length}) seem to have been set. `max_new_tokens` will take precedence. "
+                #     "Please refer to the documentation for more information. "
+                #     "(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)"
+                # )
+                pass
             generation_config.max_length = generation_config.max_new_tokens + input_ids_length
 
         elif has_default_max_length:
@@ -348,7 +349,7 @@ class DreamGenerationMixin:
         # Set pad token if unset (and there are conditions to do so)
         if pad_token_tensor is None and eos_token_tensor is not None:
             pad_token_tensor = eos_token_tensor[0]
-            logger.warning(f"Setting `pad_token_id` to `eos_token_id`:{pad_token_tensor} for open-end generation.")
+            # logger.warning(f"Setting `pad_token_id` to `eos_token_id`:{pad_token_tensor} for open-end generation.")
 
         # Update generation config with the updated special tokens tensors
         # NOTE: this must be written into a different attribute name than the one holding the original special tokens
@@ -499,7 +500,7 @@ class DreamGenerationMixin:
             left_tokens_last_step = 0
         while i < steps:
             mask_index = (x == mask_token_id)
-            logger.info(f"[Diffusion] step={i} alg={alg} num_mask_tokens={mask_index.sum().item()}")
+            # logger.info(f"[Diffusion] step={i} alg={alg} num_mask_tokens={mask_index.sum().item()}")
             outputs = self(x, attention_mask, tok_idx)
             logits = getattr(outputs, "logits", None)
             if logits is None:
@@ -539,8 +540,8 @@ class DreamGenerationMixin:
                         full_text = tokenizer.decode(x_temp[0], skip_special_tokens=False)
                         generated_text = tokenizer.decode(x_temp[0][prompt_len:], skip_special_tokens=True)
                         code_text = extract_code_from_output(generated_text)
-                        logger.info(f"[AST][step={i}] full_text: {full_text}")
-                        logger.info(f"[AST][step={i}] code_text: {code_text}")
+                        # logger.info(f"[AST][step={i}] full_text: {full_text}")
+                        # logger.info(f"[AST][step={i}] code_text: {code_text}")
 
                         if code_text:
                             start_idx = generated_text.find(code_text)
@@ -596,19 +597,20 @@ class DreamGenerationMixin:
                                                 orig_rank = float(code_ranks[j])
                                                 token_id = x0[k].item()
                                                 safe_token_str = tokenizer.decode([token_id]).replace("\n", "\\n")
-                                                logger.info(
-                                                    f"[AST-Weight][step={i}] "
-                                                    f"pos={int(pos)} token='{safe_token_str}' "
-                                                    f"orig_rank={orig_rank:.2f} weight={normalized_weights[j].item():.4f} "
-                                                    f"conf_before={old_conf:.6f} conf_after={new_conf:.6f}"
-                                                )
-                    except Exception as e:
-                        logger.warning(f"Code-token rank weighting failed: {e}")
+                                                # logger.info(
+                                                #     f"[AST-Weight][step={i}] "
+                                                #     f"pos={int(pos)} token='{safe_token_str}' "
+                                                #     f"orig_rank={orig_rank:.2f} weight={normalized_weights[j].item():.4f} "
+                                                #     f"conf_before={old_conf:.6f} conf_after={new_conf:.6f}"
+                                                # )
+                    except Exception:
+                        # logger.warning(f"Code-token rank weighting failed: {e}")
+                        pass
 
                 # --- Weighted Remasking Logic End ---
 
                 mean_conf_step = float(confidence.mean())
-                logger.info(f"[AST-Conf][alg={alg}][step={i}] mean_conf={mean_conf_step:.6f}")
+                # logger.info(f"[AST-Conf][alg={alg}][step={i}] mean_conf={mean_conf_step:.6f}")
 
                 x_ = torch.zeros_like(x, device=self.device, dtype=torch.long) + mask_token_id
                 x_[mask_index] = x0.clone()
@@ -638,8 +640,8 @@ class DreamGenerationMixin:
                         tok_id = x_[0, pos].item()
                         tok_str = tokenizer.decode([tok_id]).replace("\n", "\\n")
                         tokens_str.append(f"{pos}:{tok_str}")
-                    logger.info(f"[AST-Unmask][alg={alg}][step={i}] positions={selected_positions}")
-                    logger.info(f"[AST-Unmask][alg={alg}][step={i}] tokens={tokens_str}")
+                    # logger.info(f"[AST-Unmask][alg={alg}][step={i}] positions={selected_positions}")
+                    # logger.info(f"[AST-Unmask][alg={alg}][step={i}] tokens={tokens_str}")
 
                 x[transfer_index] = x_[transfer_index].clone()
 
@@ -653,7 +655,7 @@ class DreamGenerationMixin:
                 else:
                     raise RuntimeError(f"Unknown alg: {alg}")
                 mean_conf_step = float(confidence.mean())
-                logger.info(f"[AST-Conf][alg={alg}][step={i}] mean_conf_before_ast={mean_conf_step:.6f}")
+                # logger.info(f"[AST-Conf][alg={alg}][step={i}] mean_conf_before_ast={mean_conf_step:.6f}")
                 # --- Code-token rank-weighted remasking (same as confidence_threshold, no DAG, use rank_pred) ---
                 if tokenizer is not None and rank_values is not None and extract_code_from_output is not None:
                     try:
@@ -665,8 +667,8 @@ class DreamGenerationMixin:
                             full_text_b = tokenizer.decode(x_temp[b], skip_special_tokens=False)
                             generated_text = tokenizer.decode(x_temp[b][prompt_len:], skip_special_tokens=True)
                             code_text = extract_code_from_output(generated_text)
-                            logger.info(f"[AST][step={i}] full_text (b={b}): {full_text_b}")
-                            logger.info(f"[AST][step={i}] code_text (b={b}): {code_text}")
+                            # logger.info(f"[AST][step={i}] full_text (b={b}): {full_text_b}")
+                            # logger.info(f"[AST][step={i}] code_text (b={b}): {code_text}")
                             if not code_text:
                                 continue
                             start_idx = generated_text.find(code_text)
@@ -727,14 +729,15 @@ class DreamGenerationMixin:
                                     orig_rank = float(code_ranks[j])
                                     token_id = x0[flat_idx].item()
                                     safe_token_str = tokenizer.decode([token_id]).replace("\n", "\\n")
-                                    logger.info(
-                                        f"[AST-Weight][step={i}][b={b}] "
-                                        f"pos={int(pos)} token='{safe_token_str}' "
-                                        f"orig_rank={orig_rank:.2f} weight={normalized_weights[j].item():.4f} "
-                                        f"conf_before={old_conf:.6f} conf_after={new_conf:.6f}"
-                                    )
-                    except Exception as e:
-                        logger.warning(f"Code-token rank weighting failed: {e}")
+                                    # logger.info(
+                                    #     f"[AST-Weight][step={i}][b={b}] "
+                                    #     f"pos={int(pos)} token='{safe_token_str}' "
+                                    #     f"orig_rank={orig_rank:.2f} weight={normalized_weights[j].item():.4f} "
+                                    #     f"conf_before={old_conf:.6f} conf_after={new_conf:.6f}"
+                                    # )
+                    except Exception:
+                        # logger.warning(f"Code-token rank weighting failed: {e}")
+                        pass
                 # --- Weighted Remasking Logic End ---
 
                 num_mask_token = mask_index.sum() / mask_index.shape[0]
@@ -763,8 +766,8 @@ class DreamGenerationMixin:
                                 tok_id = x_[b, pos].item()
                                 tok_str = tokenizer.decode([tok_id]).replace("\n", "\\n")
                                 tokens_str.append(f"{pos}:{tok_str}")
-                            logger.info(f"[AST-Unmask][alg={alg}][step={i}][b={b}] positions={selected_positions}")
-                            logger.info(f"[AST-Unmask][alg={alg}][step={i}][b={b}] tokens={tokens_str}")
+                            # logger.info(f"[AST-Unmask][alg={alg}][step={i}][b={b}] positions={selected_positions}")
+                            # logger.info(f"[AST-Unmask][alg={alg}][step={i}][b={b}] tokens={tokens_str}")
 
             # this allows user-defined token control of the intermediate steps
             x = generation_tokens_hook_func(i, x, logits)

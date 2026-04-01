@@ -30,8 +30,6 @@ from models.dream_multitask.tokenization_dream import DreamTokenizer
 MODEL_PATH = "projects/sft_dream_py_ast/multitask_stage2_totalmean_0-5_codeonly_2e-6lr_2lm_8ga_4gpus_m7_1000traincases_2epochs/checkpoint-1000"
 MAX_NEW_TOKENS = 512
 DIFFUSION_STEPS = 512
-BLOCK_SIZE = 512
-USE_CACHE = False
 TOP_P = 0.9
 TEMPERATURE = 0.1
 ALG = "entropy"
@@ -39,7 +37,6 @@ ALG_TEMP = 0.1
 THRESHOLD = None  # set to float (e.g. 0.9) to use confidence_threshold
 RANK_EPS = 1e-4   # for code-token rank weighting in ast_ex
 
-use_cache = USE_CACHE
 model_path = MODEL_PATH
 model = DreamModel.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
 tokenizer = DreamTokenizer.from_pretrained(model_path, trust_remote_code=True, padding_side="left")
@@ -96,9 +93,6 @@ gen_kwargs = {
     "rank_eps": RANK_EPS,
     "generation_tokens_hook_func": generation_tokens_hook_func,
 }
-if USE_CACHE:
-    gen_kwargs["use_cache"] = True
-    gen_kwargs["block_length"] = BLOCK_SIZE
 if THRESHOLD is not None:
     gen_kwargs["alg"] = "confidence_threshold"
 

@@ -37,7 +37,6 @@ ALG = "entropy"
 ALG_TEMP = 0.1
 THRESHOLD = None  # set to float (e.g. 0.9) to use confidence_threshold
 
-use_cache = USE_CACHE
 model_path = MODEL_PATH
 model = DreamModel.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
 tokenizer = DreamTokenizer.from_pretrained(model_path, trust_remote_code=True, padding_side="left")
@@ -96,8 +95,7 @@ gen_kwargs = {
     "generation_tokens_hook_func": generation_tokens_hook_func,
 }
 if USE_CACHE:
-    gen_kwargs["use_cache"] = True
-    gen_kwargs["block_length"] = BLOCK_SIZE
+        gen_kwargs["block_length"] = BLOCK_SIZE
 if THRESHOLD is not None:
     gen_kwargs["alg"] = "confidence_threshold"
 

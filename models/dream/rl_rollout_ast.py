@@ -227,9 +227,6 @@ def main():
     max_new_tokens = int(phase_cfg.get("max_new_tokens", 2048))
     alg = str(phase_cfg.get("alg", "entropy"))
     alg_temp = float(phase_cfg.get("alg_temp", 0.1))
-    use_cache = bool(phase_cfg.get("use_cache", False))
-    dual_cache = bool(phase_cfg.get("dual_cache", False))
-    block_size = int(phase_cfg.get("block_size", 32))
     threshold = phase_cfg.get("threshold", None)
     threshold = float(threshold) if threshold is not None else None
     use_rsp_prefix = bool(phase_cfg.get("use_rsp_prefix", True))
@@ -241,9 +238,6 @@ def main():
             f"[rollout] mode={cfg.experiment.function} "
             f"max_new_tokens={max_new_tokens} steps={steps} num_resp={num_resp}"
         )
-
-    if use_cache:
-        raise ValueError("AST rollout currently does not support use_cache=True.")
 
     dataset_path = resolve_dataset_path(root, dataset_name)
     data = load_records(dataset_path)
@@ -301,9 +295,6 @@ def main():
                 "top_k": top_k,
                 "alg": alg,
                 "alg_temp": alg_temp,
-                "use_cache": use_cache,
-                "dual_cache": dual_cache,
-                "block_length": block_size if use_cache else None,
                 "threshold": threshold,
                 "tokenizer": tokenizer,
             }

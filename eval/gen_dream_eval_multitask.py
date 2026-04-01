@@ -10,11 +10,12 @@ import types
 try:
     from models.dream_multitask import DreamModel
     from models.dream_multitask.tokenization_dream import DreamTokenizer
-    from models.dream_multitask.generation_utils_block import DreamGenerationMixin as BlockDreamGenerationMixin
+    from models.dream_multitask.generation_utils import DreamGenerationMixin
 except ImportError as e:
     logger.warning(f"Could not import Dream model components: {e}. Ensure you are in the correct environment and 'model' package is available.")
     DreamModel = None
     DreamTokenizer = None
+    DreamGenerationMixin = None
 
 # Global switch: True = use "Here is the optimized code:\n```python\n" prefix (aligned with sft_dream_dataset_m); False = prompt only
 USE_RSP_PREFIX = True
@@ -47,7 +48,7 @@ class BenchmarkGenerator:
         # Same prefix as sft_dream_dataset_m.py tgt_code_response_template (before {{tgt_code}})
         self.tgt_code_response_prefix = '''Here is the optimized code:\n```python\n'''
 
-    def load_model(self, use_cache: bool = False):
+    def load_model(self):
         logger.info(f"Loading model from {self.model_path}...")
         self.model = DreamModel.from_pretrained(
             self.model_path,
@@ -61,21 +62,14 @@ class BenchmarkGenerator:
             padding_side="left"
         )
         
-        # Patch generation methods for Dream model variants (Diffusion/Block)
-        if use_cache:
-            self.model.diffusion_generate = types.MethodType(BlockDreamGenerationMixin.diffusion_generate, self.model)
-            self.model._sample = types.MethodType(BlockDreamGenerationMixin._sample, self.model)
-            logger.info("Using block generation cache")
-        else:
-            logger.info("Using full generation")
+        logger.info("Using full generation")
+        self.model.diffusion_generate = types.MethodType(DreamGenerationMixin.diffusion_generate, self.model)
+        self.model._sample = types.MethodType(DreamGenerationMixin._sample, self.model)
     def generate(self,
                  num_generations: int = 1,
                  max_new_tokens: int = 2048,
                  temperature: float = 0.0,
                  diffusion_steps: int = 256,
-                 use_cache: bool = False,
-                 dual_cache: bool = False,
-                 block_size: int = 32,
                  threshold: float = None,
                  top_p: float = 0.95,
                  alg_temp: float = 0.1,
@@ -93,7 +87,7 @@ class BenchmarkGenerator:
             logger.error("DreamModel not imported. Cannot proceed.")
             return
 
-        self.load_model(use_cache)
+        self.load_model()
         
         # Load test data
         if not os.path.exists(self.test_data_path):
@@ -162,9 +156,6 @@ class BenchmarkGenerator:
                 "top_k": top_k,
                 "alg": alg,
                 "alg_temp": alg_temp,
-                "use_cache": use_cache,
-                "dual_cache": dual_cache,
-                "block_length": block_size if use_cache else None,
                 "threshold": threshold,
                 "tokenizer": self.tokenizer,
                 # "generation_tokens_hook_func": generation_tokens_hook_func
@@ -248,9 +239,6 @@ def main(
     num_generations: int = 4,
     max_new_tokens: int = 1024,
     diffusion_steps: int = 1024,
-    use_cache: bool = False,
-    dual_cache: bool = False,
-    block_size: int = 32,
     threshold: float = None,
     top_p: float = 0.9,
     alg_temp: float = 0.1,
@@ -270,9 +258,6 @@ def main(
         num_generations: Number of samples per problem.
         max_new_tokens: Max tokens to generate.
         diffusion_steps: Number of diffusion steps.
-        use_cache: Enable block generation cache (semi-ar).
-        dual_cache: Enable dual cache.
-        block_size: Block size for cache.
         threshold: Confidence threshold for generation.
         top_p: Nucleus sampling probability.
         alg_temp: Algorithm temperature for diffusion sampling.
@@ -291,9 +276,6 @@ def main(
         num_generations=num_generations,
         max_new_tokens=max_new_tokens,
         diffusion_steps=diffusion_steps,
-        use_cache=use_cache,
-        dual_cache=dual_cache,
-        block_size=block_size,
         threshold=threshold,
         top_p=top_p,
         alg_temp=alg_temp,
