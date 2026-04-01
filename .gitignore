@@ -1,0 +1,12 @@
+data/
+docs/
+results/
+projects/
+__pycache__/
+.vscode/
+.cursor/
+*.log
+*.md
+temp/
+temp_utils/
+wandb/
