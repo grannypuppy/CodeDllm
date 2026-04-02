@@ -7,7 +7,7 @@ accelerate:
 
 experiment:
   project: "rl_dream_py"
-  run_name: "sft-dream-multitask-ckpt1000-rl-5e-7lr-2lm-8ga-4gpus-rklw0.005"
+  run_name: "run_name=sft-dream-multitask-ckpt1000-rl-2lm-8ga-4gpus-rklw0.0"
   # When true, rl.py uses models/dream_multitask/rl_rollout_ast.py and train/rl_dream_train_multitask.py
   use_dream_multitask: true
   function: "train"
@@ -54,6 +54,9 @@ rollout:
     "128_256": 128
     "256_512": 256
 
+reward:
+  baseline_results_path: "results/baseline/baseline/batch_results.jsonl"
+
 evaluation:
   dataset_limit: 100
   num_response_per_task: 8
@@ -91,7 +94,7 @@ training:
   beta: 0.0
   use_kl_estimator_k3: true
   # Dual-head loss: total += rank_loss_weight * rank_GRPO (Gaussian policy on rank head outputs).
-  rank_loss_weight: 0.005
+  rank_loss_weight: 0.0
   rank_sigma: 0.1
   resume_from_checkpoint: null
 
