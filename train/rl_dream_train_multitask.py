@@ -69,6 +69,11 @@ def _sanitize_name_part(s: str) -> str:
     return str(s).replace("/", ".").replace("\\", ".")
 
 
+def _short_outputs_stem(model_path: str, config_path: str) -> str:
+    """Must match models/dream_multitask/rl_rollout_ast.get_outputs_filename stem."""
+    return f"{_sanitize_name_part(Path(str(model_path)).name)}-{_sanitize_name_part(Path(str(config_path)).name)}"
+
+
 def _get_wandb_run_id(project_dir: Path) -> str:
     run_id_file = project_dir / "wandb_run_id.txt"
     if run_id_file.exists():
@@ -221,9 +226,16 @@ def compute_logp_old_tok_parallel(accelerator, model, dataset, dataloader, pad_i
 def resolve_rollout_outputs_path(cfg, root: Path, run_name: str, current_round: int) -> Path:
     model_path = str(cfg.model.pretrained_model)
     config_path = str(cfg.config)
-    outputs_name = f"{_sanitize_name_part(model_path)}-{_sanitize_name_part(config_path)}"
-    filename = f"round_{current_round}-outputs-{outputs_name}.jsonl"
-    return root / "projects" / cfg.experiment.project / run_name / "rollouts" / filename
+    roll_dir = root / "projects" / cfg.experiment.project / run_name / "rollouts"
+    short_file = f"round_{current_round}-outputs-{_short_outputs_stem(model_path, config_path)}.jsonl"
+    p = roll_dir / short_file
+    if p.exists():
+        return p
+    legacy_file = f"round_{current_round}-outputs-{_sanitize_name_part(model_path)}-{_sanitize_name_part(config_path)}.jsonl"
+    p_legacy = roll_dir / legacy_file
+    if p_legacy.exists():
+        return p_legacy
+    return p
 
 
 def load_training_records(cfg, root: Path, run_name: str, current_round: int):

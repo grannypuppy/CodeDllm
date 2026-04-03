@@ -368,6 +368,7 @@ def main():
             root=root,
             overrides={
                 "config": cfg_path,
+                "experiment.run_name": run_name,
                 "experiment.current_round": eval_only_round,
                 "experiment.function": "evaluation",
                 "model.pretrained_model": round_ckpt_str,
@@ -378,6 +379,7 @@ def main():
             root=root,
             overrides={
                 "config": cfg_path,
+                "experiment.run_name": run_name,
                 "experiment.current_round": eval_only_round,
                 "experiment.function": "evaluation",
                 "model.pretrained_model": round_ckpt_str,
@@ -400,6 +402,7 @@ def main():
     resume_ckpt_path = cfg.training.get("resume_from_checkpoint", None)
     if resume_ckpt_path is not None:
         resume_ckpt_path = str(resume_ckpt_path)
+
 
     for round_i in range(start_round, total_round + 1):
         print(f"\n[RL] ===== Round {round_i}/{total_round} =====")
@@ -439,6 +442,7 @@ def main():
             root=root,
             overrides={
                 "config": cfg_path,
+                "experiment.run_name": run_name,
                 "experiment.current_round": round_i,
                 "experiment.function": "train",
                 "model.pretrained_model": model_path,
@@ -454,6 +458,7 @@ def main():
             root=root,
             overrides={
                 "config": cfg_path,
+                "experiment.run_name": run_name,
                 "experiment.current_round": round_i,
                 "experiment.function": "train",
                 "model.pretrained_model": model_path,
@@ -464,6 +469,7 @@ def main():
         # 3) Train — DeepSpeed ZeRO-3 subprocess via accelerate; exits with full GPU cleanup.
         train_overrides = {
             "config": cfg_path,
+            "experiment.run_name": run_name,
             "experiment.current_round": round_i,
             "experiment.function": "train",
             "model.pretrained_model": model_path,
@@ -490,6 +496,7 @@ def main():
                 root=root,
                 overrides={
                     "config": cfg_path,
+                    "experiment.run_name": run_name,
                     "experiment.current_round": round_i,
                     "experiment.function": "evaluation",
                     "model.pretrained_model": round_ckpt_str,
@@ -500,6 +507,7 @@ def main():
                 root=root,
                 overrides={
                     "config": cfg_path,
+                    "experiment.run_name": run_name,
                     "experiment.current_round": round_i,
                     "experiment.function": "evaluation",
                     "model.pretrained_model": round_ckpt_str,

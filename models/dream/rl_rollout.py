@@ -176,13 +176,17 @@ def _sanitize_name_part(s: str) -> str:
     return str(s).replace("/", ".").replace("\\", ".")
 
 
+def _short_outputs_stem(model_path: str, config_path: str) -> str:
+    """Basenames only (e.g. checkpoint dir + yaml name) to avoid Errno 36 on long paths."""
+    return f"{_sanitize_name_part(Path(str(model_path)).name)}-{_sanitize_name_part(Path(str(config_path)).name)}"
+
+
 def get_outputs_name(model_path: str, config_path: str):
-    return f"{_sanitize_name_part(model_path)}-{_sanitize_name_part(config_path)}"
+    return _short_outputs_stem(model_path, config_path)
 
 
 def get_outputs_filename(model_path: str, config_path: str, current_round: int) -> str:
-    outputs_name = get_outputs_name(model_path, config_path)
-    return f"round_{current_round}-outputs-{outputs_name}.jsonl"
+    return f"round_{current_round}-outputs-{get_outputs_name(model_path, config_path)}.jsonl"
 
 
 def get_outputs_dirname(function_name: str) -> str:

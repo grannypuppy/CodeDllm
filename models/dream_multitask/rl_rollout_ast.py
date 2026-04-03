@@ -77,9 +77,18 @@ def _sanitize_name_part(s: str) -> str:
     return str(s).replace("/", ".").replace("\\", ".")
 
 
+def _short_outputs_stem(model_path: str, config_path: str) -> str:
+    """Use basename only (model dir name + config yaml name) to avoid Errno 36 on long paths."""
+    return f"{_sanitize_name_part(Path(str(model_path)).name)}-{_sanitize_name_part(Path(str(config_path)).name)}"
+
+
+def get_outputs_name(model_path: str, config_path: str) -> str:
+    """Same stem as dream/rl_rollout_ast.get_outputs_name (basename pair)."""
+    return _short_outputs_stem(model_path, config_path)
+
+
 def get_outputs_filename(model_path: str, config_path: str, current_round: int) -> str:
-    outputs_name = f"{_sanitize_name_part(model_path)}-{_sanitize_name_part(config_path)}"
-    return f"round_{current_round}-outputs-{outputs_name}.jsonl"
+    return f"round_{current_round}-outputs-{_short_outputs_stem(model_path, config_path)}.jsonl"
 
 
 def get_outputs_dirname(function_name: str) -> str:
@@ -337,9 +346,21 @@ def main():
                 batch_attention_mask = attention_mask_single
                 batch_repeats = num_resp
             else:
-                batch_input_ids = input_ids_single.repeat(num_resp, 1)
-                batch_attention_mask = attention_mask_single.repeat(num_resp, 1)
-                batch_repeats = 1
+                # Memory-safe chunking for long diffusion; avoid large in-batch repeat(n, 1)
+                # that can OOM on multitask/base dream models (aligned with cweval/ai_dream.py).
+                MEMORY_SAFE_MAX_REPEAT = 4
+                steps_cap = 512
+                if steps >= steps_cap and num_resp > MEMORY_SAFE_MAX_REPEAT:
+                    chunk_repeat = MEMORY_SAFE_MAX_REPEAT
+                    assert num_resp % chunk_repeat == 0, (
+                        f"rollout.num_response_per_task must be divisible by {chunk_repeat}, got {num_resp}"
+                    )
+                    batch_repeats = (num_resp + chunk_repeat - 1) // chunk_repeat
+                else:
+                    chunk_repeat = num_resp
+                    batch_repeats = 1
+                batch_input_ids = input_ids_single.repeat(chunk_repeat, 1)
+                batch_attention_mask = attention_mask_single.repeat(chunk_repeat, 1)
 
             for _ in range(batch_repeats):
                 with torch.no_grad():

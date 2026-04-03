@@ -274,16 +274,25 @@ class RewardBuilder:
     def _sanitize_name_part(self, s: str) -> str:
         return str(s).replace("/", ".").replace("\\", ".")
 
-    def _outputs_name(self, model_path: str, config_path: str) -> str:
+    def _outputs_name_short(self, model_path: str, config_path: str) -> str:
+        """Basenames only; matches dream_multitask rl_rollout_ast output naming."""
+        return (
+            f"{self._sanitize_name_part(Path(str(model_path)).name)}-"
+            f"{self._sanitize_name_part(Path(str(config_path)).name)}"
+        )
+
+    def _outputs_name_long(self, model_path: str, config_path: str) -> str:
+        """Legacy: full paths sanitized (very long filenames)."""
         return f"{self._sanitize_name_part(model_path)}-{self._sanitize_name_part(config_path)}"
 
     def _outputs_filename(self, model_path: str, config_path: str, current_round: int) -> str:
-        outputs_name = self._outputs_name(model_path, config_path)
-        return f"round_{current_round}-outputs-{outputs_name}.jsonl"
+        return f"round_{current_round}-outputs-{self._outputs_name_short(model_path, config_path)}.jsonl"
+
+    def _outputs_filename_legacy_jsonl_long(self, model_path: str, config_path: str, current_round: int) -> str:
+        return f"round_{current_round}-outputs-{self._outputs_name_long(model_path, config_path)}.jsonl"
 
     def _outputs_filename_legacy_json(self, model_path: str, config_path: str, current_round: int) -> str:
-        outputs_name = self._outputs_name(model_path, config_path)
-        return f"round_{current_round}-outputs-{outputs_name}.json"
+        return f"round_{current_round}-outputs-{self._outputs_name_long(model_path, config_path)}.json"
 
     def _outputs_dirname(self) -> str:
         function_name = str(self.cfg.experiment.get("function", "train"))
@@ -297,24 +306,27 @@ class RewardBuilder:
         config_path = str(self.cfg.config)
         current_round = int(self.cfg.experiment.current_round)
         run_name = self._run_name()
-        outputs_file = self._outputs_filename(model_path, config_path, current_round)
         outputs_dir = self._outputs_dirname()
-        path = root / "projects" / self.cfg.experiment.project / run_name / outputs_dir / outputs_file
-        if path.exists():
-            data = []
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        data.append(json.loads(line))
-            return data, path
+        base = root / "projects" / self.cfg.experiment.project / run_name / outputs_dir
 
-        legacy_file = self._outputs_filename_legacy_json(model_path, config_path, current_round)
-        legacy_path = root / "projects" / self.cfg.experiment.project / run_name / outputs_dir / legacy_file
+        for outputs_file in (
+            self._outputs_filename(model_path, config_path, current_round),
+            self._outputs_filename_legacy_jsonl_long(model_path, config_path, current_round),
+        ):
+            path = base / outputs_file
+            if path.exists():
+                data = []
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            data.append(json.loads(line))
+                return data, path
+
+        legacy_path = base / self._outputs_filename_legacy_json(model_path, config_path, current_round)
         with open(legacy_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        path = legacy_path
-        return data, path
+        return data, legacy_path
 
     def _save_outputs(self, data, path: Path):
         if path.suffix == ".jsonl":
